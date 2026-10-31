@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+logs/*
+configs/proxy.json
+settings.json
+bin/sing-box.exe
