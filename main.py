@@ -13,6 +13,8 @@ import sys
 import threading
 import time
 import traceback
+import uuid
+import winreg
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
@@ -58,20 +60,33 @@ COLOR_BUSY = "#ffb74d"
 COLOR_ICON = "#168bdb"
 COLOR_TRAY_OFF = "#7a8394"
 
-# Case-insensitive Go regexps matched against the full path of the process.
-APP_PRESETS: dict[str, tuple[str, list[str]]] = {
-    "chrome": ("Google Chrome", [r"(?i)\\chrome\.exe$"]),
-    # Claude Code, Codex and other extensions run their own executables from the extensions folder.
-    "vscode": ("VS Code", [r"(?i)\\code\.exe$", r"(?i)\\\.vscode\\extensions\\"]),
-    # Hermes.exe is only the UI: LLM requests come from the backend run by Hermes' own
-    # Python, which, like its bundled node/chromium/git, lives in %LOCALAPPDATA%\hermes.
-    "hermes": ("Hermes", [r"(?i)\\AppData\\Local\\hermes\\"]),
+# Programs are matched by their full path (see resolve_apps), not by the file name:
+# another chrome.exe, e.g. the Chromium of Playwright, does not go through the proxy.
+APP_PRESETS: dict[str, str] = {
+    "chrome": "Google Chrome",
+    "vscode": "VS Code",
+    "hermes": "Hermes",
 }
+
+TUN_ADDRESSES = ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
+# How often newly started programs of the selected folders are added to the kill switch.
+KILL_SWITCH_POLL_S = 5
+PROGRAMS_CACHE_PATH = LOG_DIR / "programs-cache.json"
+KILL_SWITCH_STATE_PATH = LOG_DIR / "kill-switch-state.json"
+# Traffic to these addresses never goes through the proxy (LAN, loopback, multicast),
+# so the kill switch leaves it alone.
+NON_INTERNET_NETWORKS = [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
+    "::/127", "fc00::/7", "fe80::/10", "ff00::/8"
+]
 
 DEFAULT_SETTINGS = {
     "proxy_type": "socks",
     "apps": {key: True for key in APP_PRESETS},
     "custom_apps": "",
+    # Without sing-box the selected programs get no internet instead of going direct.
+    "kill_switch": True,
     # True writes every connection to logs\sing-box.log; otherwise only warnings and errors.
     "verbose_log": False,
     "profiles": {
@@ -134,6 +149,10 @@ if os.name == "nt":
     kernel32.WaitForSingleObject.restype = wintypes.DWORD
     kernel32.LocalFree.argtypes = [ctypes.c_void_p]
     kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.K32EnumProcesses.argtypes = [
+        ctypes.POINTER(wintypes.DWORD), wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel32.K32EnumProcesses.restype = wintypes.BOOL
     advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
         wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p
     ]
@@ -240,8 +259,9 @@ def load_settings() -> dict[str, Any]:
 
     if isinstance(data.get("custom_apps"), str):
         settings["custom_apps"] = data["custom_apps"]
-    if isinstance(data.get("verbose_log"), bool):
-        settings["verbose_log"] = data["verbose_log"]
+    for key in ("verbose_log", "kill_switch"):
+        if isinstance(data.get(key), bool):
+            settings[key] = data[key]
     return settings
 
 
@@ -254,29 +274,601 @@ def save_settings(data: dict[str, Any]) -> None:
 
 
 def parse_custom_apps(text: str) -> list[str]:
-    names: dict[str, str] = {}
+    """Entries of the "other programs" field: names like telegram.exe or full paths."""
+    entries: dict[str, str] = {}
     for item in re.split(r"[,;\n]", text):
-        name = Path(item.strip().strip('"')).name
-        if not name:
+        entry = os.path.expandvars(item.strip().strip('"').strip())
+        if not entry:
             continue
-        if not name.lower().endswith(".exe"):
-            name += ".exe"
-        names.setdefault(name.lower(), name)
-    return list(names.values())
+        if not is_path_entry(entry) and not entry.lower().endswith(".exe"):
+            entry += ".exe"
+        entries.setdefault(entry.lower(), entry)
+    return list(entries.values())
 
 
-def build_app_patterns(apps: dict[str, bool], custom_apps: str) -> list[str]:
-    patterns = [
-        pattern
-        for key, (_, preset_patterns) in APP_PRESETS.items()
-        if apps.get(key)
-        for pattern in preset_patterns
+def is_path_entry(entry: str) -> bool:
+    return any(char in entry for char in "\\/:")
+
+
+class AppTargets:
+    """What goes through the proxy: exact .exe paths and whole folders."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, str] = {}
+        self.dirs: dict[str, str] = {}
+
+    def add_file(self, path: str | Path) -> None:
+        text = os.path.normpath(str(path))
+        self.files.setdefault(text.lower(), text)
+
+    def add_dir(self, path: str | Path) -> None:
+        text = os.path.normpath(str(path)).rstrip("\\")
+        self.dirs.setdefault(text.lower(), text)
+
+    def __bool__(self) -> bool:
+        return bool(self.files or self.dirs)
+
+    def matches(self, path: str) -> bool:
+        lower = os.path.normpath(path).lower()
+        return lower in self.files or any(lower.startswith(d + "\\") for d in self.dirs)
+
+    def regex_patterns(self) -> list[str]:
+        """Case-insensitive Go regexps for sing-box's process_path_regex."""
+        return (
+            [f"(?i)^{go_regex_escape(path)}$" for path in self.files.values()]
+            + [f"(?i)^{go_regex_escape(path)}\\\\" for path in self.dirs.values()]
+        )
+
+    def describe(self) -> list[str]:
+        return list(self.files.values()) + [path + "\\" for path in self.dirs.values()]
+
+
+def go_regex_escape(text: str) -> str:
+    # re.escape also escapes spaces, which Go regexps reject.
+    return re.sub(r"([\\.+*?()|\[\]{}^$])", r"\\\1", text)
+
+
+def env_path(name: str, *parts: str) -> Path | None:
+    base = os.environ.get(name)
+    return Path(base, *parts) if base else None
+
+
+def process_image_path(pid: int) -> str | None:
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        image_path = ctypes.create_unicode_buffer(32768)
+        path_length = wintypes.DWORD(len(image_path))
+        if not kernel32.QueryFullProcessImageNameW(
+            handle, 0, image_path, ctypes.byref(path_length)
+        ):
+            return None
+        return image_path.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def running_process_paths() -> list[str]:
+    pids = (wintypes.DWORD * 8192)()
+    needed = wintypes.DWORD()
+    if not kernel32.K32EnumProcesses(pids, ctypes.sizeof(pids), ctypes.byref(needed)):
+        return []
+    count = needed.value // ctypes.sizeof(wintypes.DWORD)
+    paths = {}
+    for pid in pids[:count]:
+        path = process_image_path(pid) if pid else None
+        if path:
+            paths.setdefault(path.lower(), path)
+    return list(paths.values())
+
+
+def registry_app_paths(exe_name: str) -> list[Path]:
+    """Paths registered for the program in "App Paths" (what Win+R uses)."""
+    found = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(
+                hive, rf"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe_name}"
+            ) as key:
+                value, _ = winreg.QueryValueEx(key, "")
+        except OSError:
+            continue
+        if isinstance(value, str) and value.strip():
+            found.append(Path(os.path.expandvars(value.strip().strip('"'))))
+    return found
+
+
+def registry_install_locations(display_name_prefix: str) -> list[Path]:
+    found = []
+    uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                root = winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view)
+            except OSError:
+                continue
+            with root:
+                index = 0
+                while True:
+                    try:
+                        name = winreg.EnumKey(root, index)
+                    except OSError:
+                        break
+                    index += 1
+                    try:
+                        with winreg.OpenKey(root, name) as key:
+                            display_name = str(winreg.QueryValueEx(key, "DisplayName")[0])
+                            location = str(winreg.QueryValueEx(key, "InstallLocation")[0])
+                    except OSError:
+                        continue
+                    if display_name.startswith(display_name_prefix) and location.strip():
+                        found.append(Path(location.strip().strip('"')))
+    return found
+
+
+def find_chrome(running: list[str]) -> list[Path]:
+    # Google Chrome always lives in ...\Google\Chrome\Application\chrome.exe.
+    candidates = registry_app_paths("chrome.exe") + [
+        path for path in (
+            env_path("ProgramFiles", "Google", "Chrome", "Application", "chrome.exe"),
+            env_path("ProgramFiles(x86)", "Google", "Chrome", "Application", "chrome.exe"),
+            env_path("LOCALAPPDATA", "Google", "Chrome", "Application", "chrome.exe"),
+        ) if path
+    ] + [
+        Path(path) for path in running
+        if path.lower().endswith("\\google\\chrome\\application\\chrome.exe")
     ]
-    patterns += [
-        r"(?i)\\" + re.escape(name) + "$"
-        for name in parse_custom_apps(custom_apps)
+    return [path for path in candidates if path.name.lower() == "chrome.exe" and path.is_file()]
+
+
+def find_vscode(running: list[str]) -> list[Path]:
+    """VS Code installation folders."""
+    candidates = registry_install_locations("Microsoft Visual Studio Code") + [
+        path for path in (
+            env_path("LOCALAPPDATA", "Programs", "Microsoft VS Code"),
+            env_path("ProgramFiles", "Microsoft VS Code"),
+        ) if path
+    ] + [Path(path).parent for path in running if Path(path).name.lower() == "code.exe"]
+    return [path for path in candidates if (path / "Code.exe").is_file()]
+
+
+def resolve_apps(apps: dict[str, bool], custom_apps: str) -> AppTargets:
+    """Finds the full paths of the selected programs; ValueError says what is missing."""
+    targets = AppTargets()
+    running = running_process_paths()
+
+    if apps.get("chrome"):
+        chrome = find_chrome(running)
+        if not chrome:
+            raise ValueError(
+                "Google Chrome не найден в обычных папках установки. Снимите галочку "
+                "или укажите полный путь к chrome.exe в «Других программах»."
+            )
+        for path in chrome:
+            targets.add_file(path)
+
+    if apps.get("vscode"):
+        folders = find_vscode(running)
+        if not folders:
+            raise ValueError(
+                "VS Code не найден. Запустите его, снимите галочку или укажите "
+                "папку VS Code в «Других программах»."
+            )
+        # The whole folder: Code.exe and the tools bundled with it.
+        for folder in folders:
+            targets.add_dir(folder)
+        # Claude Code, Codex and other extensions run their own executables.
+        extensions = env_path("USERPROFILE", ".vscode", "extensions")
+        if extensions and extensions.is_dir():
+            targets.add_dir(extensions)
+
+    if apps.get("hermes"):
+        # Hermes.exe is only the UI: LLM requests come from the backend run by Hermes' own
+        # Python, which, like its bundled node/chromium/git, lives in %LOCALAPPDATA%\hermes.
+        hermes = env_path("LOCALAPPDATA", "hermes")
+        if not hermes or not hermes.is_dir():
+            raise ValueError("Папка Hermes (%LOCALAPPDATA%\\hermes) не найдена. Снимите галочку.")
+        targets.add_dir(hermes)
+
+    for entry in parse_custom_apps(custom_apps):
+        if is_path_entry(entry):
+            path = Path(entry)
+            if path.is_dir():
+                targets.add_dir(path)
+            elif path.is_file():
+                targets.add_file(path)
+            else:
+                raise ValueError(f"Не найден файл или папка: {entry}")
+            continue
+        # A bare name is turned into the paths of the programs with this name.
+        found = [path for path in running if Path(path).name.lower() == entry.lower()]
+        found += [str(path) for path in registry_app_paths(entry) if path.is_file()]
+        if not found:
+            raise ValueError(
+                f"Не удалось найти путь к {entry}: программа не запущена и не "
+                "зарегистрирована в Windows. Запустите её или укажите полный путь к .exe."
+            )
+        for path in found:
+            targets.add_file(path)
+    return targets
+
+
+def scan_executables(folder: str) -> list[str]:
+    found = []
+    for root, _, files in os.walk(folder):
+        found += [os.path.join(root, name) for name in files if name.lower().endswith(".exe")]
+    return found
+
+
+# --- Windows Filtering Platform (the engine under Windows Firewall) ---------------------
+
+RPC_C_AUTHN_WINNT = 10
+FWP_UINT8 = 1
+FWP_BYTE_BLOB_TYPE = 12
+FWP_V4_ADDR_MASK = 0x100
+FWP_V6_ADDR_MASK = 0x101
+FWP_MATCH_EQUAL = 0
+FWP_ACTION_BLOCK = 0x1001
+FWP_ACTION_PERMIT = 0x1002
+FWPM_FILTER_FLAG_PERSISTENT = 0x1
+FWPM_SUBLAYER_FLAG_PERSISTENT = 0x1
+FWP_E_FILTER_NOT_FOUND = 0x80320003
+FWP_E_SUBLAYER_NOT_FOUND = 0x80320007
+FWP_E_ALREADY_EXISTS = 0x80320009
+
+LAYER_CONNECT_V4 = "c38d57d1-05a7-4c33-904f-7fbceee60e82"
+LAYER_CONNECT_V6 = "4a72393b-319f-44bc-84c3-ba54dcb3b6b4"
+CONDITION_APP_ID = "d78e1e87-8644-4ea5-9437-d809ecefc971"
+CONDITION_LOCAL_ADDRESS = "d9ee00de-c1ef-4617-bfe3-ffd8f5a08957"
+CONDITION_REMOTE_ADDRESS = "b235ae9a-1d64-49b8-a44c-5ff3d9095045"
+KILL_SWITCH_SUBLAYER = "6f1c0d9e-6d0b-4f57-9a43-2c1a4a6e5b71"
+KILL_SWITCH_NAMESPACE = uuid.UUID("0b5c3a52-58a4-4d8e-9a7e-3f9e1f0c2d10")
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD), ("Data4", ctypes.c_ubyte * 8)
     ]
-    return patterns
+
+    @classmethod
+    def of(cls, value: str | uuid.UUID) -> "GUID":
+        guid = cls()
+        ctypes.memmove(ctypes.byref(guid), uuid.UUID(str(value)).bytes_le, 16)
+        return guid
+
+
+class FWP_BYTE_BLOB(ctypes.Structure):
+    _fields_ = [("size", ctypes.c_uint32), ("data", ctypes.c_void_p)]
+
+
+class FWP_V4_ADDR_AND_MASK(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint32), ("mask", ctypes.c_uint32)]
+
+
+class FWP_V6_ADDR_AND_MASK(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_ubyte * 16), ("prefixLength", ctypes.c_ubyte)]
+
+
+class FWP_VALUE_UNION(ctypes.Union):
+    _fields_ = [("uint8", ctypes.c_uint8), ("uint32", ctypes.c_uint32), ("pointer", ctypes.c_void_p)]
+
+
+class FWP_VALUE0(ctypes.Structure):
+    # FWP_CONDITION_VALUE0 has the same layout.
+    _fields_ = [("type", ctypes.c_int), ("value", FWP_VALUE_UNION)]
+
+
+class FWPM_FILTER_CONDITION0(ctypes.Structure):
+    _fields_ = [("fieldKey", GUID), ("matchType", ctypes.c_int), ("conditionValue", FWP_VALUE0)]
+
+
+class FWPM_DISPLAY_DATA0(ctypes.Structure):
+    _fields_ = [("name", ctypes.c_wchar_p), ("description", ctypes.c_wchar_p)]
+
+
+class FWPM_ACTION0(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_uint32), ("filterType", GUID)]
+
+
+class FWPM_FILTER_CONTEXT(ctypes.Union):
+    _fields_ = [("rawContext", ctypes.c_uint64), ("providerContextKey", GUID)]
+
+
+class FWPM_FILTER0(ctypes.Structure):
+    _fields_ = [
+        ("filterKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", ctypes.c_uint32),
+        ("providerKey", ctypes.c_void_p),
+        ("providerData", FWP_BYTE_BLOB),
+        ("layerKey", GUID),
+        ("subLayerKey", GUID),
+        ("weight", FWP_VALUE0),
+        ("numFilterConditions", ctypes.c_uint32),
+        ("filterCondition", ctypes.POINTER(FWPM_FILTER_CONDITION0)),
+        ("action", FWPM_ACTION0),
+        ("context", FWPM_FILTER_CONTEXT),
+        ("reserved", ctypes.c_void_p),
+        ("filterId", ctypes.c_uint64),
+        ("effectiveWeight", FWP_VALUE0),
+    ]
+
+
+class FWPM_SUBLAYER0(ctypes.Structure):
+    _fields_ = [
+        ("subLayerKey", GUID),
+        ("displayData", FWPM_DISPLAY_DATA0),
+        ("flags", ctypes.c_uint32),
+        ("providerKey", ctypes.c_void_p),
+        ("providerData", FWP_BYTE_BLOB),
+        ("weight", ctypes.c_uint16),
+    ]
+
+
+if os.name == "nt":
+    fwpuclnt = ctypes.WinDLL("fwpuclnt")
+    for _name, _args in {
+        "FwpmEngineOpen0": [ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_void_p,
+                            ctypes.POINTER(wintypes.HANDLE)],
+        "FwpmEngineClose0": [wintypes.HANDLE],
+        "FwpmTransactionBegin0": [wintypes.HANDLE, ctypes.c_uint32],
+        "FwpmTransactionCommit0": [wintypes.HANDLE],
+        "FwpmTransactionAbort0": [wintypes.HANDLE],
+        "FwpmSubLayerAdd0": [wintypes.HANDLE, ctypes.POINTER(FWPM_SUBLAYER0), ctypes.c_void_p],
+        "FwpmSubLayerDeleteByKey0": [wintypes.HANDLE, ctypes.POINTER(GUID)],
+        "FwpmFilterAdd0": [wintypes.HANDLE, ctypes.POINTER(FWPM_FILTER0), ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_uint64)],
+        "FwpmFilterDeleteByKey0": [wintypes.HANDLE, ctypes.POINTER(GUID)],
+        "FwpmFilterGetByKey0": [wintypes.HANDLE, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)],
+        "FwpmGetAppIdFromFileName0": [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)],
+        "FwpmFreeMemory0": [ctypes.POINTER(ctypes.c_void_p)],
+    }.items():
+        _function = getattr(fwpuclnt, _name)
+        _function.argtypes = _args
+        _function.restype = None if _name == "FwpmFreeMemory0" else wintypes.DWORD
+
+
+def wfp_check(code: int, action: str, allowed: tuple[int, ...] = ()) -> int:
+    if code and code not in allowed:
+        raise RuntimeError(f"WFP: {action} — ошибка 0x{code:08X}")
+    return code
+
+
+def filter_key(name: str) -> GUID:
+    return GUID.of(uuid.uuid5(KILL_SWITCH_NAMESPACE, name))
+
+
+def address_condition(field: str, network: ipaddress.IPv4Network | ipaddress.IPv6Network,
+                      keep: list[Any]) -> FWPM_FILTER_CONDITION0:
+    condition = FWPM_FILTER_CONDITION0(fieldKey=GUID.of(field), matchType=FWP_MATCH_EQUAL)
+    if network.version == 4:
+        value = FWP_V4_ADDR_AND_MASK(int(network.network_address), int(network.netmask))
+        condition.conditionValue.type = FWP_V4_ADDR_MASK
+    else:
+        value = FWP_V6_ADDR_AND_MASK(
+            (ctypes.c_ubyte * 16)(*network.network_address.packed), network.prefixlen
+        )
+        condition.conditionValue.type = FWP_V6_ADDR_MASK
+    keep.append(value)
+    condition.conditionValue.value.pointer = ctypes.addressof(value)
+    return condition
+
+
+class KillSwitch:
+    """WFP filters that keep the selected programs off the internet past the TUN.
+
+    In its own sublayer: connections from the TUN address and to LAN addresses are
+    permitted, every other outgoing connection of the selected programs is blocked.
+    While sing-box runs, their traffic goes through the TUN and is not affected; once
+    sing-box stops, it is blocked instead of going direct. The filters are persistent:
+    they stay until disarm(), even across reboots. All of them change in one
+    transaction, so there is no moment without protection while the list is updated.
+    """
+
+    FILTERS = [
+        (layer, kind)
+        for layer in ("v4", "v6")
+        for kind in ("permit-tun", "permit-lan", "block-apps")
+    ]
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.covered: set[str] = set()
+        self.programs: dict[str, str] = {}
+        self.is_armed = False
+
+    @property
+    def armed(self) -> bool:
+        return self.is_armed
+
+    @staticmethod
+    def _open() -> wintypes.HANDLE:
+        engine = wintypes.HANDLE()
+        wfp_check(
+            fwpuclnt.FwpmEngineOpen0(None, RPC_C_AUTHN_WINNT, None, None, ctypes.byref(engine)),
+            "подключение к Base Filtering Engine"
+        )
+        return engine
+
+    def _transaction(self, work: Callable[[wintypes.HANDLE], None]) -> None:
+        engine = self._open()
+        try:
+            wfp_check(fwpuclnt.FwpmTransactionBegin0(engine, 0), "начало транзакции")
+            try:
+                work(engine)
+            except BaseException:
+                fwpuclnt.FwpmTransactionAbort0(engine)
+                raise
+            wfp_check(fwpuclnt.FwpmTransactionCommit0(engine), "сохранение транзакции")
+        finally:
+            fwpuclnt.FwpmEngineClose0(engine)
+
+    def _delete_filters(self, engine: wintypes.HANDLE) -> None:
+        for layer, kind in self.FILTERS:
+            key = filter_key(f"{layer}-{kind}")
+            wfp_check(
+                fwpuclnt.FwpmFilterDeleteByKey0(engine, ctypes.byref(key)),
+                "удаление фильтра", (FWP_E_FILTER_NOT_FOUND,)
+            )
+
+    def _add_filters(self, engine: wintypes.HANDLE, programs: list[str]) -> int:
+        """Adds the filters; returns how many programs got into the block list."""
+        sublayer = FWPM_SUBLAYER0(
+            subLayerKey=GUID.of(KILL_SWITCH_SUBLAYER),
+            displayData=FWPM_DISPLAY_DATA0("Proxy Manager kill switch", None),
+            flags=FWPM_SUBLAYER_FLAG_PERSISTENT,
+            weight=0x100
+        )
+        wfp_check(
+            fwpuclnt.FwpmSubLayerAdd0(engine, ctypes.byref(sublayer), None),
+            "создание подуровня", (FWP_E_ALREADY_EXISTS,)
+        )
+
+        app_ids: list[ctypes.c_void_p] = []
+        keep: list[Any] = []
+        try:
+            for path in programs:
+                blob = ctypes.c_void_p()
+                # Fails for files that no longer exist; those need no blocking.
+                if fwpuclnt.FwpmGetAppIdFromFileName0(path, ctypes.byref(blob)) == 0:
+                    app_ids.append(blob)
+            if not app_ids:
+                raise RuntimeError("Не найдено ни одной программы для блокировки.")
+
+            for layer, kind in self.FILTERS:
+                version = 4 if layer == "v4" else 6
+                conditions: list[FWPM_FILTER_CONDITION0] = []
+                if kind == "permit-tun":
+                    networks = [n for n in map(lambda t: ipaddress.ip_network(t, strict=False), TUN_ADDRESSES)
+                                if n.version == version]
+                    conditions = [address_condition(CONDITION_LOCAL_ADDRESS, n, keep) for n in networks]
+                elif kind == "permit-lan":
+                    networks = [n for n in map(ipaddress.ip_network, NON_INTERNET_NETWORKS)
+                                if n.version == version]
+                    conditions = [address_condition(CONDITION_REMOTE_ADDRESS, n, keep) for n in networks]
+                else:
+                    # Conditions on the same field are OR-ed: any of the programs.
+                    for blob in app_ids:
+                        condition = FWPM_FILTER_CONDITION0(
+                            fieldKey=GUID.of(CONDITION_APP_ID), matchType=FWP_MATCH_EQUAL
+                        )
+                        condition.conditionValue.type = FWP_BYTE_BLOB_TYPE
+                        condition.conditionValue.value.pointer = blob.value
+                        conditions.append(condition)
+                array = (FWPM_FILTER_CONDITION0 * len(conditions))(*conditions)
+                filter_ = FWPM_FILTER0(
+                    filterKey=filter_key(f"{layer}-{kind}"),
+                    displayData=FWPM_DISPLAY_DATA0(f"Proxy Manager kill switch: {kind} {layer}", None),
+                    flags=FWPM_FILTER_FLAG_PERSISTENT,
+                    layerKey=GUID.of(LAYER_CONNECT_V4 if version == 4 else LAYER_CONNECT_V6),
+                    subLayerKey=GUID.of(KILL_SWITCH_SUBLAYER),
+                    numFilterConditions=len(conditions),
+                    filterCondition=array,
+                )
+                # Within the sublayer the heaviest matching filter decides: permits win.
+                filter_.weight.type = FWP_UINT8
+                filter_.weight.value.uint8 = 1 if kind == "block-apps" else 15
+                filter_.action.type = FWP_ACTION_BLOCK if kind == "block-apps" else FWP_ACTION_PERMIT
+                wfp_check(
+                    fwpuclnt.FwpmFilterAdd0(engine, ctypes.byref(filter_), None, None),
+                    f"добавление фильтра {kind} {layer}"
+                )
+            return len(app_ids)
+        finally:
+            for blob in app_ids:
+                fwpuclnt.FwpmFreeMemory0(ctypes.byref(blob))
+
+    def _save_state(self) -> None:
+        try:
+            KILL_SWITCH_STATE_PATH.write_text(
+                json.dumps({"armed": self.is_armed, "programs": sorted(self.programs.values())},
+                           ensure_ascii=False),
+                encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    def refresh(self) -> None:
+        """Reads from WFP whether the filters are in place."""
+        with self.lock:
+            engine = self._open()
+            try:
+                key = filter_key("v4-block-apps")
+                result = ctypes.c_void_p()
+                code = fwpuclnt.FwpmFilterGetByKey0(engine, ctypes.byref(key), ctypes.byref(result))
+                wfp_check(code, "чтение фильтра", (FWP_E_FILTER_NOT_FOUND,))
+                if result:
+                    fwpuclnt.FwpmFreeMemory0(ctypes.byref(result))
+                self.is_armed = code == 0
+            finally:
+                fwpuclnt.FwpmEngineClose0(engine)
+            self.programs = {}
+            if self.is_armed:
+                try:
+                    state = json.loads(KILL_SWITCH_STATE_PATH.read_text(encoding="utf-8"))
+                    self.programs = {path.lower(): path for path in state.get("programs", [])}
+                except (OSError, ValueError, AttributeError, TypeError):
+                    pass
+            self.covered = set(self.programs)
+
+    def arm(self, programs: list[str]) -> None:
+        """Replaces the filters with a set for these programs in one transaction."""
+        with self.lock:
+            wanted = {path.lower(): path for path in programs}
+            self._transaction(lambda engine: (
+                self._delete_filters(engine), self._add_filters(engine, list(wanted.values()))
+            ))
+            self.is_armed = True
+            self.programs = wanted
+            self.covered = set(wanted)
+            self._save_state()
+
+    def extend(self, programs: list[str]) -> int:
+        """Adds programs not covered yet; returns how many were added."""
+        with self.lock:
+            missing = {path.lower(): path for path in programs if path.lower() not in self.covered}
+            if not self.is_armed or not missing:
+                return 0
+            wanted = {**self.programs, **missing}
+            self._transaction(lambda engine: (
+                self._delete_filters(engine), self._add_filters(engine, list(wanted.values()))
+            ))
+            self.programs = wanted
+            self.covered = set(wanted)
+            self._save_state()
+            return len(missing)
+
+    def disarm(self) -> None:
+        with self.lock:
+            def work(engine: wintypes.HANDLE) -> None:
+                self._delete_filters(engine)
+                key = GUID.of(KILL_SWITCH_SUBLAYER)
+                wfp_check(
+                    fwpuclnt.FwpmSubLayerDeleteByKey0(engine, ctypes.byref(key)),
+                    "удаление подуровня", (FWP_E_SUBLAYER_NOT_FOUND,)
+                )
+            self._transaction(work)
+            self.is_armed = False
+            self.programs = {}
+            self.covered = set()
+            self._save_state()
+
+
+def load_programs_cache() -> dict[str, list[str]]:
+    try:
+        data = json.loads(PROGRAMS_CACHE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_programs_cache(cache: dict[str, list[str]]) -> None:
+    try:
+        PROGRAMS_CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def parse_proxy_string(text: str) -> dict[str, str] | None:
@@ -542,6 +1134,11 @@ class ProxyManager:
         self.process: subprocess.Popen | None = None
         self.log_offset = 0
         self.lock = threading.Lock()
+        self.kill_switch = KillSwitch()
+        # The programs of the current connection, for the kill switch to follow.
+        self.targets: AppTargets | None = None
+        self.programs_cache = load_programs_cache()
+        self.cache_lock = threading.Lock()
 
     def is_running(self) -> bool:
         process = self.process
@@ -578,19 +1175,8 @@ class ProxyManager:
 
     @staticmethod
     def _is_singbox_process(pid: int) -> bool:
-        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            image_path = ctypes.create_unicode_buffer(32768)
-            path_length = wintypes.DWORD(len(image_path))
-            if not kernel32.QueryFullProcessImageNameW(
-                handle, 0, image_path, ctypes.byref(path_length)
-            ):
-                return False
-            return Path(image_path.value).resolve() == BIN_PATH.resolve()
-        finally:
-            kernel32.CloseHandle(handle)
+        image_path = process_image_path(pid)
+        return image_path is not None and Path(image_path).resolve() == BIN_PATH.resolve()
 
     def _remove_pid_file(self, pid: int | None = None) -> None:
         if pid is not None and self._tracked_pid() != pid:
@@ -672,10 +1258,7 @@ class ProxyManager:
                     "type": "tun",
                     "tag": "tun-in",
                     "interface_name": "singbox",
-                    "address": [
-                        "172.19.0.1/30",
-                        "fdfe:dcba:9876::1/126"
-                    ],
+                    "address": TUN_ADDRESSES,
                     "auto_route": True,
                     "strict_route": True
                 },
@@ -702,9 +1285,9 @@ class ProxyManager:
             }
         }
 
-    def write_config(self, data: dict[str, Any]) -> int:
+    def write_config(self, data: dict[str, Any], path: Path = CONFIG_PATH) -> int:
         ip_check_port = find_free_port()
-        CONFIG_PATH.write_text(
+        path.write_text(
             json.dumps(self.build_config(data, ip_check_port), indent=2, ensure_ascii=False),
             encoding="utf-8"
         )
@@ -749,10 +1332,52 @@ class ProxyManager:
         time.sleep(0.3)
         return self.process.poll() is None
 
+    def kill_switch_programs(self, targets: AppTargets, scan: bool = False) -> list[str]:
+        """The .exe files the kill switch covers.
+
+        Folders hold hundreds of thousands of files, so their .exe lists come from a cache
+        that scan=True refreshes; running programs from the folders are always added.
+        """
+        programs = dict(targets.files)
+        for key, folder in targets.dirs.items():
+            if scan:
+                found = scan_executables(folder)
+                with self.cache_lock:
+                    self.programs_cache[key] = found
+                    save_programs_cache(dict(self.programs_cache))
+            else:
+                with self.cache_lock:
+                    found = list(self.programs_cache.get(key, []))
+            for path in found:
+                programs.setdefault(path.lower(), path)
+        for path in running_process_paths():
+            if targets.matches(path):
+                programs.setdefault(path.lower(), path)
+        # sing-box and this app must reach the proxy server directly.
+        for path in (str(BIN_PATH), process_image_path(os.getpid())):
+            if path:
+                programs.pop(os.path.normpath(path).lower(), None)
+        return list(programs.values())
+
+    def follow_programs(self, scan: bool = False) -> int:
+        """Adds kill switch rules for new programs of the selected folders."""
+        targets = self.targets
+        if targets is None or not self.kill_switch.armed:
+            return 0
+        return self.kill_switch.extend(self.kill_switch_programs(targets, scan=scan))
+
+    def _undo_kill_switch(self, was_armed: bool) -> None:
+        # A failed first connection should not leave the programs without internet.
+        if was_armed or not self.kill_switch.armed:
+            return
+        try:
+            self.kill_switch.disarm()
+        except Exception:
+            log_app_error(traceback.format_exc())
+
     def connect(self, data: dict[str, Any]) -> tuple[bool, str]:
+        """Starts sing-box; a running one is replaced (reconnect) without a gap in the kill switch."""
         with self.lock:
-            if self.is_running():
-                return False, "Прокси уже подключён."
             if not BIN_PATH.is_file():
                 return False, (
                     "Не найден bin\\sing-box.exe. Скачайте Windows amd64 "
@@ -763,10 +1388,12 @@ class ProxyManager:
             if problem:
                 return False, problem
 
+            was_armed = self.kill_switch.armed
+            new_config = CONFIG_PATH.with_name("proxy.new.json")
             try:
-                ip_check_port = self.write_config(data)
+                ip_check_port = self.write_config(data, new_config)
                 check = subprocess.run(
-                    [str(BIN_PATH), "check", "--disable-color", "-c", str(CONFIG_PATH)],
+                    [str(BIN_PATH), "check", "--disable-color", "-c", str(new_config)],
                     stdin=subprocess.DEVNULL,
                     capture_output=True,
                     encoding="utf-8",
@@ -778,6 +1405,17 @@ class ProxyManager:
                 if check.returncode != 0:
                     detail = strip_ansi(check.stderr or check.stdout or "Неизвестная ошибка").strip()
                     return False, f"Ошибка конфигурации sing-box:\n{detail}"
+
+                if self.is_running():
+                    self._stop_singbox()
+                os.replace(new_config, CONFIG_PATH)
+
+                targets: AppTargets = data["targets"]
+                if data["kill_switch"]:
+                    self.kill_switch.arm(self.kill_switch_programs(targets))
+                elif self.kill_switch.armed:
+                    self.kill_switch.disarm()
+                self.targets = targets
 
                 rotate_log()
                 # sing-box keeps its own copy of the handle, so ours can be closed at once.
@@ -795,14 +1433,19 @@ class ProxyManager:
 
                 if not self._wait_until_started(ip_check_port):
                     self._stop_own_process()
+                    self._undo_kill_switch(was_armed)
                     return False, "sing-box не запустился.\n" + self._log_tail()
 
                 return True, "Прокси подключён. Проверяем внешний IP..."
             except subprocess.TimeoutExpired:
                 return False, "Проверка конфигурации заняла слишком много времени."
             except Exception as exc:
+                log_app_error(traceback.format_exc())
                 self._stop_own_process()
+                self._undo_kill_switch(was_armed)
                 return False, f"Не удалось запустить sing-box: {exc}"
+            finally:
+                new_config.unlink(missing_ok=True)
 
     def _stop_own_process(self) -> None:
         if self.process is None:
@@ -816,33 +1459,47 @@ class ProxyManager:
         self._remove_pid_file(self.process.pid)
         self.process = None
 
+    def _stop_singbox(self) -> str:
+        """Stops sing-box and returns what happened; raises if it could not."""
+        if self.process is not None:
+            pid = self.process.pid
+            if self.process.poll() is None:
+                try:
+                    self.process.terminate()
+                    self.process.wait(timeout=8)
+                except (OSError, subprocess.TimeoutExpired):
+                    self._force_stop(pid)
+                    self.process.wait(timeout=5)
+            self._remove_pid_file(pid)
+            self.process = None
+            return "Прокси отключён."
+
+        pid = self._tracked_pid()
+        if pid is None:
+            return "Прокси уже отключён."
+        if not self._is_singbox_process(pid):
+            self._remove_pid_file(pid)
+            return "Запущенный sing-box не найден; файл состояния очищен."
+        self._force_stop(pid)
+        self._remove_pid_file(pid)
+        return "Зависший sing-box остановлен."
+
     def disconnect(self) -> tuple[bool, str]:
+        """Stops sing-box and removes the kill switch: the programs go direct again."""
         with self.lock:
             try:
-                if self.process is not None:
-                    pid = self.process.pid
-                    if self.process.poll() is None:
-                        try:
-                            self.process.terminate()
-                            self.process.wait(timeout=8)
-                        except (OSError, subprocess.TimeoutExpired):
-                            self._force_stop(pid)
-                            self.process.wait(timeout=5)
-                    self._remove_pid_file(pid)
-                    self.process = None
-                    return True, "Прокси отключён."
-
-                pid = self._tracked_pid()
-                if pid is None:
-                    return True, "Прокси уже отключён."
-                if not self._is_singbox_process(pid):
-                    self._remove_pid_file(pid)
-                    return True, "Запущенный sing-box не найден; файл состояния очищен."
-                self._force_stop(pid)
-                self._remove_pid_file(pid)
-                return True, "Зависший sing-box остановлен; интернет-маршрут восстановлен."
+                message = self._stop_singbox()
             except Exception as exc:
                 return False, f"Не удалось остановить sing-box: {exc}"
+            self.targets = None
+            if self.kill_switch.armed:
+                try:
+                    self.kill_switch.disarm()
+                except Exception as exc:
+                    log_app_error(traceback.format_exc())
+                    return False, f"{message}\nНе удалось снять kill switch: {exc}"
+                message += " Kill switch снят, программы снова ходят в сеть напрямую."
+            return True, message
 
     @staticmethod
     def _force_stop(pid: int) -> None:
@@ -871,6 +1528,8 @@ class ProxyApp:
         self.busy_text = ""
         self.running = False
         self.ip_check_id = 0
+        self.following = False
+        self.next_follow = 0.0
         self.tray: pystray.Icon | None = None
         self.tray_hint_shown = False
         self.ui_calls: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
@@ -880,8 +1539,8 @@ class ProxyApp:
 
         self.root = ctk.CTk()
         self.root.title("Proxy Manager")
-        self.root.geometry("480x660")
-        self.root.minsize(440, 620)
+        self.root.geometry("500x690")
+        self.root.minsize(460, 650)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.report_callback_exception = self._on_tk_error
         if ensure_icon_file():
@@ -904,6 +1563,7 @@ class ProxyApp:
             ).start()
         self.root.after(100, self._process_ui_calls)
         self.root.after(STATUS_POLL_MS, self._poll_status)
+        self._load_kill_switch()
         if self.running:
             self._show_message("sing-box уже был запущен — подключение подхвачено.")
             self.check_ip()
@@ -912,6 +1572,15 @@ class ProxyApp:
     @property
     def busy(self) -> bool:
         return self.operations > 0
+
+    @property
+    def blocked(self) -> bool:
+        """sing-box is not running, but the kill switch keeps the programs off the internet."""
+        return not self.running and self.manager.kill_switch.armed
+
+    @property
+    def can_disconnect(self) -> bool:
+        return (self.running or self.blocked) and not self.busy
 
     def _build_ui(self) -> None:
         ctk.CTkLabel(
@@ -967,7 +1636,7 @@ class ProxyApp:
         apps_row = ctk.CTkFrame(self.root, fg_color="transparent")
         apps_row.pack(fill="x", padx=PAD_X)
         self.app_vars: dict[str, ctk.BooleanVar] = {}
-        for key, (title, _) in APP_PRESETS.items():
+        for key, title in APP_PRESETS.items():
             var = ctk.BooleanVar(value=self.settings["apps"][key])
             ctk.CTkCheckBox(
                 apps_row, text=title, variable=var,
@@ -978,13 +1647,20 @@ class ProxyApp:
 
         self.custom_apps_entry = ctk.CTkEntry(
             self.root, height=34,
-            placeholder_text="Другие программы через запятую: telegram.exe"
+            placeholder_text="Другие программы: telegram.exe или полный путь к .exe/папке"
         )
         self.custom_apps_entry.pack(fill="x", padx=PAD_X, pady=(6, 0))
         if self.settings["custom_apps"]:
             self.custom_apps_entry.insert(0, self.settings["custom_apps"])
         for sequence in ("<FocusOut>", "<Return>"):
             self.custom_apps_entry.bind(sequence, self._on_custom_apps_edited)
+
+        self.kill_switch_var = ctk.BooleanVar(value=self.settings["kill_switch"])
+        ctk.CTkCheckBox(
+            self.root, text="Kill switch: без прокси эти программы остаются без интернета",
+            variable=self.kill_switch_var, onvalue=True, offvalue=False,
+            command=self._on_apps_changed
+        ).pack(fill="x", padx=PAD_X + 4, pady=(8, 0))
 
         buttons = ctk.CTkFrame(self.root, fg_color="transparent")
         buttons.pack(fill="x", padx=PAD_X, pady=(16, 0))
@@ -1074,6 +1750,7 @@ class ProxyApp:
     def _store_apps(self) -> None:
         self.settings["apps"] = self._selected_apps()
         self.settings["custom_apps"] = self.custom_apps_entry.get().strip()
+        self.settings["kill_switch"] = self.kill_switch_var.get()
 
     def _save_settings(self) -> None:
         self._store_current_profile()
@@ -1141,10 +1818,8 @@ class ProxyApp:
         if not 1 <= port <= 65535:
             raise ValueError("Порт должен быть числом от 1 до 65535.")
 
-        app_patterns = build_app_patterns(
-            self._selected_apps(), self.custom_apps_entry.get()
-        )
-        if not app_patterns:
+        targets = resolve_apps(self._selected_apps(), self.custom_apps_entry.get())
+        if not targets:
             raise ValueError("Выберите хотя бы одну программу, которая будет работать через прокси.")
 
         return {
@@ -1153,7 +1828,9 @@ class ProxyApp:
             "port": port,
             "username": self.user_entry.get().strip(),
             "password": self.password_entry.get(),
-            "app_patterns": app_patterns,
+            "targets": targets,
+            "app_patterns": targets.regex_patterns(),
+            "kill_switch": self.kill_switch_var.get(),
             "verbose_log": self.settings["verbose_log"]
         }
 
@@ -1197,21 +1874,19 @@ class ProxyApp:
         self._save_settings()
         reconnect = self.running
 
-        def task() -> tuple[bool, str]:
-            if reconnect:
-                ok, message = self.manager.disconnect()
-                if not ok:
-                    return ok, message
-            return self.manager.connect(data)
-
         def done(ok: bool, message: str) -> None:
             self._report(message)
             if ok:
                 self.check_ip()
+                if self.manager.kill_switch.armed:
+                    self._follow_programs(scan=True)
             else:
                 self._reset_ip_label()
 
-        self._run_operation("Переподключение..." if reconnect else "Подключение...", task, done)
+        self._run_operation(
+            "Переподключение..." if reconnect else "Подключение...",
+            lambda: self.manager.connect(data), done
+        )
 
     def disconnect(self) -> None:
         if self.busy or self.quitting:
@@ -1285,6 +1960,9 @@ class ProxyApp:
             status, color, tray_color = self.busy_text, COLOR_BUSY, COLOR_BUSY
         elif self.running:
             status, color, tray_color = "Подключено", COLOR_CONNECTED, COLOR_CONNECTED
+        elif self.blocked:
+            status, color, tray_color = "Нет прокси — программы заблокированы", \
+                COLOR_DISCONNECTED, COLOR_DISCONNECTED
         else:
             status, color, tray_color = "Отключено", COLOR_DISCONNECTED, COLOR_TRAY_OFF
 
@@ -1296,7 +1974,7 @@ class ProxyApp:
             state="disabled" if self.busy else "normal"
         )
         self.disconnect_button.configure(
-            state="normal" if self.running and not self.busy else "disabled"
+            state="normal" if self.can_disconnect else "disabled"
         )
         if self.tray:
             self.tray.icon = make_icon_image(tray_color)
@@ -1314,11 +1992,61 @@ class ProxyApp:
                 self._update_state()
                 if not running:
                     self._reset_ip_label()
+                    if self.manager.kill_switch.armed:
+                        tail = (
+                            "Kill switch заблокировал интернет выбранным программам. "
+                            "Нажмите «Подключить», чтобы вернуть прокси, или «Отключить», "
+                            "чтобы программы снова ходили напрямую."
+                        )
+                    else:
+                        tail = "Трафик программ снова идёт напрямую."
                     self._report(
-                        reason or "sing-box остановлен. Трафик программ снова идёт напрямую.",
-                        force_notify=True
+                        f"{reason or 'sing-box остановлен.'}\n{tail}", force_notify=True
                     )
+            if self.manager.kill_switch.armed and time.monotonic() >= self.next_follow:
+                self._follow_programs()
         self.root.after(STATUS_POLL_MS, self._poll_status)
+
+    def _follow_programs(self, scan: bool = False) -> None:
+        """Covers newly started programs of the selected folders by the kill switch."""
+        self.next_follow = time.monotonic() + KILL_SWITCH_POLL_S
+        if self.following or not self.manager.kill_switch.armed:
+            return
+        self.following = True
+
+        def worker() -> None:
+            try:
+                self.manager.follow_programs(scan=scan)
+            except Exception:
+                log_app_error(traceback.format_exc())
+            finally:
+                self.following = False
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _load_kill_switch(self) -> None:
+        """Reads the kill switch state from WFP, e.g. after a crash or a reboot."""
+        def worker() -> None:
+            try:
+                self.manager.kill_switch.refresh()
+                if self.manager.kill_switch.armed and self.manager.targets is None:
+                    self.manager.targets = resolve_apps(
+                        self.settings["apps"], self.settings["custom_apps"]
+                    )
+            except Exception:
+                log_app_error(traceback.format_exc())
+            self._call_in_ui(self._kill_switch_loaded)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _kill_switch_loaded(self) -> None:
+        self._update_state()
+        if self.blocked:
+            self._report(
+                "Kill switch включён, а прокси не подключён: выбранные программы без "
+                "интернета. Нажмите «Подключить» или «Отключить».",
+                force_notify=True
+            )
 
     def _call_in_ui(self, call: Callable[[], None]) -> None:
         # Tk is not thread-safe: other threads hand their work to the main loop.
@@ -1361,7 +2089,7 @@ class ProxyApp:
             pystray.MenuItem(
                 "Отключить",
                 lambda icon, item: self._call_in_ui(self.disconnect),
-                enabled=lambda item: self.running and not self.busy
+                enabled=lambda item: self.can_disconnect
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(
