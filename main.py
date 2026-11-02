@@ -48,6 +48,18 @@ START_TIMEOUT = 40
 STATUS_POLL_MS = 1500
 INSTANCE_EVENT_NAME = "Local\\ProxyManagerShowWindow"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# Its own process group lets sing-box get Ctrl+Break, on which it removes the TUN adapter.
+SINGBOX_FLAGS = NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+GRACEFUL_STOP_TIMEOUT = 10
+TUN_START_ATTEMPTS = 3
+# Run in a separate process: attaching to the console of sing-box would otherwise
+# detach this app from its own console.
+CTRL_BREAK_SCRIPT = (
+    "import ctypes,sys;k=ctypes.WinDLL('kernel32');k.FreeConsole();"
+    "pid=int(sys.argv[1]);"
+    "ok=k.AttachConsole(pid) and k.SetConsoleCtrlHandler(None,True) "
+    "and k.GenerateConsoleCtrlEvent(1,pid);sys.exit(0 if ok else 1)"
+)
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 PROXY_TYPE_LABELS = {"socks": "SOCKS5", "http": "HTTP"}
@@ -1129,6 +1141,19 @@ def create_instance_event() -> int | None:
     return event
 
 
+def send_ctrl_break(pid: int) -> bool:
+    """Asks sing-box to shut down cleanly, as Ctrl+Break in its console would."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", CTRL_BREAK_SCRIPT, str(pid)],
+            stdin=subprocess.DEVNULL, capture_output=True, timeout=10,
+            creationflags=NO_WINDOW
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 class ProxyManager:
     def __init__(self) -> None:
         self.process: subprocess.Popen | None = None
@@ -1378,6 +1403,21 @@ class ProxyManager:
         except Exception:
             log_app_error(traceback.format_exc())
 
+    def _start_singbox(self, ip_check_port: int) -> bool:
+        # sing-box keeps its own copy of the handle, so ours can be closed at once.
+        with LOG_PATH.open("ab") as log:
+            self.log_offset = log.seek(0, os.SEEK_END)
+            self.process = subprocess.Popen(
+                [str(BIN_PATH), "run", "--disable-color", "-c", str(CONFIG_PATH)],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=str(BASE_DIR),
+                creationflags=SINGBOX_FLAGS
+            )
+        PID_PATH.write_text(str(self.process.pid), encoding="ascii")
+        return self._wait_until_started(ip_check_port)
+
     def connect(self, data: dict[str, Any]) -> tuple[bool, str]:
         """Starts sing-box; a running one is replaced (reconnect) without a gap in the kill switch."""
         with self.lock:
@@ -1421,23 +1461,18 @@ class ProxyManager:
                 self.targets = targets
 
                 rotate_log()
-                # sing-box keeps its own copy of the handle, so ours can be closed at once.
-                with LOG_PATH.open("ab") as log:
-                    self.log_offset = log.seek(0, os.SEEK_END)
-                    self.process = subprocess.Popen(
-                        [str(BIN_PATH), "run", "--disable-color", "-c", str(CONFIG_PATH)],
-                        stdin=subprocess.DEVNULL,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        cwd=str(BASE_DIR),
-                        creationflags=NO_WINDOW
-                    )
-                PID_PATH.write_text(str(self.process.pid), encoding="ascii")
-
-                if not self._wait_until_started(ip_check_port):
-                    self._stop_own_process()
-                    self._undo_kill_switch(was_armed)
+                for attempt in range(1, TUN_START_ATTEMPTS + 1):
+                    if self._start_singbox(ip_check_port):
+                        break
                     tail = self._log_tail()
+                    self._stop_own_process()
+                    # Windows sometimes refuses to create the TUN adapter for a while,
+                    # e.g. while removing the adapter of a previous run.
+                    if "tun interface" not in tail or attempt == TUN_START_ATTEMPTS:
+                        break
+                    time.sleep(3 * attempt)
+                if self.process is None:
+                    self._undo_kill_switch(was_armed)
                     hint = ""
                     if "tun interface" in tail:
                         hint = (
@@ -1463,6 +1498,12 @@ class ProxyManager:
         if self.process is None:
             return
         if self.process.poll() is None:
+            if send_ctrl_break(self.process.pid):
+                try:
+                    self.process.wait(timeout=GRACEFUL_STOP_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self.process.poll() is None:
             self.process.kill()
             try:
                 self.process.wait(timeout=5)
@@ -1476,10 +1517,16 @@ class ProxyManager:
         if self.process is not None:
             pid = self.process.pid
             if self.process.poll() is None:
-                try:
-                    self.process.terminate()
-                    self.process.wait(timeout=8)
-                except (OSError, subprocess.TimeoutExpired):
+                # A killed sing-box leaves its TUN adapter behind, and the next start
+                # then fails to create one; Ctrl+Break lets it remove the adapter.
+                stopped = False
+                if send_ctrl_break(pid):
+                    try:
+                        self.process.wait(timeout=GRACEFUL_STOP_TIMEOUT)
+                        stopped = True
+                    except subprocess.TimeoutExpired:
+                        pass
+                if not stopped:
                     self._force_stop(pid)
                     self.process.wait(timeout=5)
             self._remove_pid_file(pid)
@@ -1492,7 +1539,12 @@ class ProxyManager:
         if not self._is_singbox_process(pid):
             self._remove_pid_file(pid)
             return "Запущенный sing-box не найден; файл состояния очищен."
-        self._force_stop(pid)
+        if send_ctrl_break(pid):
+            deadline = time.monotonic() + GRACEFUL_STOP_TIMEOUT
+            while time.monotonic() < deadline and self._is_singbox_process(pid):
+                time.sleep(0.2)
+        if self._is_singbox_process(pid):
+            self._force_stop(pid)
         self._remove_pid_file(pid)
         return "Зависший sing-box остановлен."
 
