@@ -44,7 +44,7 @@ IP_CHECK_INBOUND_TAG = "ip-check-in"
 IP_CHECK_HOST = "api.ipify.org"
 MAX_LOG_SIZE = 5 * 1024 * 1024
 PROXY_PROBE_TIMEOUT = 8
-START_TIMEOUT = 5
+START_TIMEOUT = 40
 STATUS_POLL_MS = 1500
 INSTANCE_EVENT_NAME = "Local\\ProxyManagerShowWindow"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1320,6 +1320,7 @@ class ProxyManager:
 
     def _wait_until_started(self, ip_check_port: int) -> bool:
         # The IP check inbound comes after the TUN, so once it listens the TUN is up.
+        # Creating the TUN adapter can take a while, e.g. right after Windows starts.
         deadline = time.monotonic() + START_TIMEOUT
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -1329,6 +1330,8 @@ class ProxyManager:
                     break
             except OSError:
                 time.sleep(0.2)
+        else:
+            return False
         time.sleep(0.3)
         return self.process.poll() is None
 
@@ -1434,7 +1437,16 @@ class ProxyManager:
                 if not self._wait_until_started(ip_check_port):
                     self._stop_own_process()
                     self._undo_kill_switch(was_armed)
-                    return False, "sing-box не запустился.\n" + self._log_tail()
+                    tail = self._log_tail()
+                    hint = ""
+                    if "tun interface" in tail:
+                        hint = (
+                            "\nWindows не дала создать TUN-адаптер. Часто так бывает сразу после "
+                            "загрузки или пока другой VPN (PlanetVPN, WireGuard и т. п.) поднимает "
+                            "свой туннель на том же драйвере Wintun. Подождите минуту и нажмите "
+                            "«Подключить» ещё раз."
+                        )
+                    return False, "sing-box не запустился.\n" + tail + hint
 
                 return True, "Прокси подключён. Проверяем внешний IP..."
             except subprocess.TimeoutExpired:
