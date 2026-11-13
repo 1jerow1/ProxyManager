@@ -18,7 +18,8 @@ import winreg
 from ctypes import wintypes
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from tkinter import TclError, filedialog, messagebox
+from typing import Any, Callable, NamedTuple
 from urllib.parse import unquote
 
 import customtkinter as ctk
@@ -47,6 +48,18 @@ PROXY_PROBE_TIMEOUT = 8
 START_TIMEOUT = 40
 STATUS_POLL_MS = 1500
 INSTANCE_EVENT_NAME = "Local\\ProxyManagerShowWindow"
+POWERSHELL_PATH = Path(
+    os.environ.get("SystemRoot", r"C:\Windows"),
+    "System32", "WindowsPowerShell", "v1.0", "powershell.exe"
+)
+READ_SHORTCUTS_SCRIPT = (
+    "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
+    "$shell=New-Object -ComObject WScript.Shell;"
+    "$links=$env:PROXY_MANAGER_LINKS|ConvertFrom-Json;"
+    "$items=@(foreach($link in $links){$s=$shell.CreateShortcut($link);"
+    "[pscustomobject]@{path=$link;target=$s.TargetPath;args=$s.Arguments}});"
+    "ConvertTo-Json -InputObject $items -Compress"
+)
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Its own process group lets sing-box get Ctrl+Break, on which it removes the TUN adapter.
 SINGBOX_FLAGS = NO_WINDOW | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -64,6 +77,11 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 PROXY_TYPE_LABELS = {"socks": "SOCKS5", "http": "HTTP"}
 PROXY_SCHEMES = {"socks": "socks", "socks5": "socks", "socks5h": "socks", "http": "http"}
+ROUTE_MODE_LABELS = {
+    "apps": "Выбранные", "except": "Все, кроме выбранных", "all": "Весь компьютер"
+}
+# The flag of a program in the list that each mode with a list reads.
+PROGRAM_FLAGS = {"apps": "enabled", "except": "excluded"}
 
 PAD_X = 24
 COLOR_CONNECTED = "#22c77a"
@@ -75,10 +93,20 @@ COLOR_TRAY_OFF = "#7a8394"
 # Programs are matched by their full path (see resolve_apps), not by the file name:
 # another chrome.exe, e.g. the Chromium of Playwright, does not go through the proxy.
 APP_PRESETS: dict[str, str] = {
+    "claude": "Claude",
     "chrome": "Google Chrome",
     "vscode": "VS Code",
     "hermes": "Hermes",
 }
+
+# The family name of the Claude desktop app package (MSIX); its install folder is
+# C:\Program Files\WindowsApps\Claude_<version>_x64__pzs8sxrjxfjjc.
+CLAUDE_PACKAGE_PREFIX = "Claude_"
+CLAUDE_PACKAGE_SUFFIX = "__pzs8sxrjxfjjc"
+APP_PACKAGES_KEY = (
+    r"Software\Classes\Local Settings\Software\Microsoft\Windows"
+    r"\CurrentVersion\AppModel\Repository\Packages"
+)
 
 TUN_ADDRESSES = ["172.19.0.1/30", "fdfe:dcba:9876::1/126"]
 # How often newly started programs of the selected folders are added to the kill switch.
@@ -92,13 +120,41 @@ NON_INTERNET_NETWORKS = [
     "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4",
     "::/127", "fc00::/7", "fe80::/10", "ff00::/8"
 ]
+# Valve's own networks (AS32590, prefixes announced in RIPE, November 2026): Steam servers
+# and most of the Steam Datagram Relay servers that carry Dota 2 and CS2 matches.
+VALVE_NETWORKS = [
+    "45.121.184.0/24", "103.10.124.0/23", "103.28.54.0/24", "146.66.152.0/24",
+    "146.66.155.0/24", "155.133.224.0/21", "155.133.236.0/22", "155.133.240.0/23",
+    "155.133.244.0/24", "155.133.246.0/24", "155.133.248.0/22", "155.133.252.0/24",
+    "155.133.254.0/23", "162.254.192.0/21", "185.25.180.0/24", "185.25.182.0/23",
+    "192.69.96.0/22", "205.196.6.0/24", "208.64.200.0/22", "208.78.164.0/22",
+    "2404:3fc0::/46", "2404:3fc0:8::/47", "2404:3fc0:a::/48", "2602:801:f000::/46",
+    "2602:801:f005::/48", "2602:801:f006::/47", "2602:801:f008::/46", "2602:801:f00d::/48",
+    "2602:801:f00e::/48", "2a01:bc80::/45", "2a01:bc80:8::/46", "2a01:bc80:c::/48"
+]
+# The other relays are rented from hosting companies (e.g. Datapacket in Frankfurt and
+# Vienna); Steam lists the current ones.
+STEAM_SDR_CONFIG_URL = "https://api.steampowered.com/ISteamApps/GetSDRConfig/v1/?appid={}"
+STEAM_GAME_APP_IDS = (570, 730)  # Dota 2, Counter-Strike 2
+VALVE_RELAYS_CACHE_PATH = LOG_DIR / "valve-relays.json"
 
 DEFAULT_SETTINGS = {
     "proxy_type": "socks",
+    "route_mode": "apps",
     "apps": {key: True for key in APP_PRESETS},
-    "custom_apps": "",
+    # The built-in programs that go direct in the "all except the selected" mode.
+    "excluded_apps": {key: False for key in APP_PRESETS},
+    # Programs added by the user: {"title", "path", "enabled", "excluded"}; the path is
+    # an .exe, a folder or a bare name like telegram.exe. "enabled" sends the program
+    # through the proxy in the selected programs mode, "excluded" keeps it direct in the
+    # "all except the selected" mode.
+    "programs": [],
+    # Discord and Dota 2 were offered as the first exceptions, see seed_exceptions.
+    "exceptions_seeded": False,
     # Without sing-box the selected programs get no internet instead of going direct.
     "kill_switch": True,
+    # Dota 2 and CS2 reach Valve's servers past the TUN, see valve_game_networks.
+    "games_direct": True,
     # True writes every connection to logs\sing-box.log; otherwise only warnings and errors.
     "verbose_log": False,
     "profiles": {
@@ -124,6 +180,9 @@ ERROR_ALREADY_EXISTS = 183
 INFINITE = 0xFFFFFFFF
 WAIT_OBJECT_0 = 0
 SDDL_REVISION_1 = 1
+CSIDL_DESKTOPDIRECTORY = 0x10
+CSIDL_COMMON_DESKTOPDIRECTORY = 0x19
+MAX_PATH = 260
 
 
 class SECURITY_ATTRIBUTES(ctypes.Structure):
@@ -178,6 +237,10 @@ if os.name == "nt":
     shell32.ShellExecuteW.restype = ctypes.c_void_p
     shell32.SetCurrentProcessExplicitAppUserModelID.argtypes = [wintypes.LPCWSTR]
     shell32.SetCurrentProcessExplicitAppUserModelID.restype = ctypes.c_long
+    shell32.SHGetFolderPathW.argtypes = [
+        wintypes.HWND, ctypes.c_int, wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR
+    ]
+    shell32.SHGetFolderPathW.restype = ctypes.c_long
     user32.MessageBoxW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT]
     user32.MessageBoxW.restype = ctypes.c_int
 
@@ -252,6 +315,8 @@ def load_settings() -> dict[str, Any]:
 
     if data.get("proxy_type") in PROXY_TYPE_LABELS:
         settings["proxy_type"] = data["proxy_type"]
+    if data.get("route_mode") in ROUTE_MODE_LABELS:
+        settings["route_mode"] = data["route_mode"]
 
     saved_profiles = data.get("profiles")
     if isinstance(saved_profiles, dict):
@@ -268,10 +333,25 @@ def load_settings() -> dict[str, Any]:
         for key in settings["apps"]:
             if isinstance(saved_apps.get(key), bool):
                 settings["apps"][key] = saved_apps[key]
+    saved_excluded = data.get("excluded_apps")
+    if isinstance(saved_excluded, dict):
+        for key in settings["excluded_apps"]:
+            if isinstance(saved_excluded.get(key), bool):
+                settings["excluded_apps"][key] = saved_excluded[key]
 
-    if isinstance(data.get("custom_apps"), str):
-        settings["custom_apps"] = data["custom_apps"]
-    for key in ("verbose_log", "kill_switch"):
+    saved_programs = data.get("programs")
+    if isinstance(saved_programs, list):
+        for item in saved_programs:
+            if isinstance(item, dict) and isinstance(item.get("path"), str) and item["path"].strip():
+                add_program(
+                    settings["programs"], item["path"].strip(), item.get("title"),
+                    item.get("enabled") is not False, item.get("excluded") is True
+                )
+    elif isinstance(data.get("custom_apps"), str):
+        # Earlier versions kept the programs as one line of text.
+        for entry in parse_custom_apps(data["custom_apps"]):
+            add_program(settings["programs"], entry)
+    for key in ("verbose_log", "kill_switch", "games_direct", "exceptions_seeded"):
         if isinstance(data.get(key), bool):
             settings[key] = data[key]
     return settings
@@ -288,7 +368,8 @@ def save_settings(data: dict[str, Any]) -> None:
 def parse_custom_apps(text: str) -> list[str]:
     """Entries of the "other programs" field: names like telegram.exe or full paths."""
     entries: dict[str, str] = {}
-    for item in re.split(r"[,;\n]", text):
+    # A path with a separator in it comes in quotes (see format_custom_apps).
+    for item in re.findall(r'\s*"[^"]*"\s*|[^,;\n]+', text):
         entry = os.path.expandvars(item.strip().strip('"').strip())
         if not entry:
             continue
@@ -296,6 +377,80 @@ def parse_custom_apps(text: str) -> list[str]:
             entry += ".exe"
         entries.setdefault(entry.lower(), entry)
     return list(entries.values())
+
+
+def format_custom_apps(entries: list[str]) -> str:
+    return ", ".join(
+        f'"{entry}"' if any(char in entry for char in ",;") else entry for entry in entries
+    )
+
+
+def add_program(programs: list[dict[str, Any]], path: str, title: Any = None,
+                enabled: bool = True, excluded: bool = False) -> None:
+    """Adds a program to the list unless this path is already there."""
+    key = os.path.normpath(path).lower()
+    if any(os.path.normpath(program["path"]).lower() == key for program in programs):
+        return
+    if not isinstance(title, str) or not title.strip():
+        title = Path(path).stem or path
+    programs.append(
+        {"title": title.strip(), "path": path, "enabled": enabled, "excluded": excluded}
+    )
+
+
+def programs_text(programs: list[dict[str, Any]], flag: str = "enabled") -> str:
+    """The programs of the list with this flag set, in the form resolve_apps takes."""
+    return format_custom_apps([program["path"] for program in programs if program[flag]])
+
+
+def steam_libraries() -> list[Path]:
+    """The Steam folder and the other folders it installs games to."""
+    roots = []
+    for hive, key_path, value in (
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam", "SteamPath"),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+    ):
+        try:
+            with winreg.OpenKey(hive, key_path) as key:
+                roots.append(Path(os.path.normpath(str(winreg.QueryValueEx(key, value)[0]))))
+        except OSError:
+            continue
+    libraries = list(roots)
+    for root in roots:
+        try:
+            text = (root / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        libraries += [
+            Path(os.path.normpath(path.replace("\\\\", "\\")))
+            for path in re.findall(r'"path"\s+"([^"]+)"', text)
+        ]
+    unique = {str(path).lower(): path for path in libraries}
+    return [path for path in unique.values() if path.is_dir()]
+
+
+def seed_exceptions(settings: dict[str, Any]) -> None:
+    """Once, puts Discord and Dota 2 into the exceptions of the "all except" mode."""
+    if settings["exceptions_seeded"]:
+        return
+    settings["exceptions_seeded"] = True
+    found: list[tuple[str, Path]] = []
+    # Discord runs from a folder per version, so its whole folder is the program.
+    discord = env_path("LOCALAPPDATA", "Discord")
+    if discord and discord.is_dir():
+        found.append(("Discord", discord))
+    for library in steam_libraries():
+        dota = library / "steamapps" / "common" / "dota 2 beta"
+        if dota.is_dir():
+            found.append(("Dota 2", dota))
+    for title, folder in found:
+        key = os.path.normpath(folder).lower()
+        for program in settings["programs"]:
+            if os.path.normpath(program["path"]).lower() == key:
+                program["excluded"] = True
+                break
+        else:
+            add_program(settings["programs"], str(folder), title, enabled=False, excluded=True)
 
 
 def is_path_entry(entry: str) -> bool:
@@ -308,6 +463,8 @@ class AppTargets:
     def __init__(self) -> None:
         self.files: dict[str, str] = {}
         self.dirs: dict[str, str] = {}
+        # Folders whose name changes with the version: description -> regexp.
+        self.versioned: dict[str, str] = {}
 
     def add_file(self, path: str | Path) -> None:
         text = os.path.normpath(str(path))
@@ -317,22 +474,40 @@ class AppTargets:
         text = os.path.normpath(str(path)).rstrip("\\")
         self.dirs.setdefault(text.lower(), text)
 
+    def add_versioned_dir(self, parent: str | Path, prefix: str, suffix: str = "") -> None:
+        """A folder parent\\<prefix><anything><suffix>: it keeps matching after an update."""
+        parent_text = os.path.normpath(str(parent)).rstrip("\\")
+        self.versioned[f"{parent_text}\\{prefix}*{suffix}\\"] = (
+            f"(?i)^{go_regex_escape(parent_text)}\\\\{go_regex_escape(prefix)}"
+            f"[^\\\\]*{go_regex_escape(suffix)}\\\\"
+        )
+
     def __bool__(self) -> bool:
         return bool(self.files or self.dirs)
 
     def matches(self, path: str) -> bool:
-        lower = os.path.normpath(path).lower()
-        return lower in self.files or any(lower.startswith(d + "\\") for d in self.dirs)
+        normal = os.path.normpath(path)
+        lower = normal.lower()
+        return (
+            lower in self.files
+            or any(lower.startswith(d + "\\") for d in self.dirs)
+            # The regexps use only syntax that Go and Python share.
+            or any(re.match(pattern, normal) for pattern in self.versioned.values())
+        )
 
     def regex_patterns(self) -> list[str]:
         """Case-insensitive Go regexps for sing-box's process_path_regex."""
         return (
             [f"(?i)^{go_regex_escape(path)}$" for path in self.files.values()]
             + [f"(?i)^{go_regex_escape(path)}\\\\" for path in self.dirs.values()]
+            + list(self.versioned.values())
         )
 
     def describe(self) -> list[str]:
-        return list(self.files.values()) + [path + "\\" for path in self.dirs.values()]
+        return (
+            list(self.files.values()) + [path + "\\" for path in self.dirs.values()]
+            + list(self.versioned)
+        )
 
 
 def go_regex_escape(text: str) -> str:
@@ -445,17 +620,93 @@ def find_vscode(running: list[str]) -> list[Path]:
     return [path for path in candidates if (path / "Code.exe").is_file()]
 
 
+def claude_package_folders() -> list[Path]:
+    """Install folders of the Claude desktop app, as Windows registered them for the user."""
+    found = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, APP_PACKAGES_KEY) as packages:
+            index = 0
+            while True:
+                try:
+                    name = winreg.EnumKey(packages, index)
+                except OSError:
+                    break
+                index += 1
+                if not (name.startswith(CLAUDE_PACKAGE_PREFIX) and name.endswith(CLAUDE_PACKAGE_SUFFIX)):
+                    continue
+                try:
+                    with winreg.OpenKey(packages, name) as key:
+                        found.append(Path(str(winreg.QueryValueEx(key, "PackageRootFolder")[0])))
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return [path for path in found if path.is_dir()]
+
+
+def add_claude(targets: AppTargets) -> bool:
+    """The Claude desktop app and Claude Code; False if none of them is installed."""
+    found = False
+    packages = claude_package_folders()
+    for folder in packages:
+        targets.add_dir(folder)
+    windows_apps = env_path("ProgramFiles", "WindowsApps")
+    if packages and windows_apps:
+        # The version is in the folder name, so an update moves the app to a new folder.
+        targets.add_versioned_dir(windows_apps, CLAUDE_PACKAGE_PREFIX, CLAUDE_PACKAGE_SUFFIX)
+        found = True
+
+    folders = [
+        # Data of the desktop app; it downloads its own Claude Code there. Newer versions
+        # of the app keep the data in Claude-Data instead of the package folder.
+        env_path("LOCALAPPDATA", "Packages", CLAUDE_PACKAGE_PREFIX + CLAUDE_PACKAGE_SUFFIX.lstrip("_")),
+        env_path("LOCALAPPDATA", "Claude-Data"),
+        # The desktop app installed without the Microsoft packaging.
+        env_path("LOCALAPPDATA", "AnthropicClaude"),
+        # Claude Code installed on its own.
+        env_path("USERPROFILE", ".local", "share", "claude"),
+    ]
+    for folder in folders:
+        if folder and folder.is_dir():
+            targets.add_dir(folder)
+            found = True
+    launcher = env_path("USERPROFILE", ".local", "bin", "claude.exe")
+    if launcher and launcher.is_file():
+        targets.add_file(launcher)
+        found = True
+
+    # Claude Code as an extension of VS Code and its forks.
+    home = os.environ.get("USERPROFILE")
+    for editor in (".vscode", ".vscode-insiders", ".cursor", ".windsurf"):
+        extensions = Path(home, editor, "extensions") if home else None
+        if not extensions or not extensions.is_dir():
+            continue
+        installed = [path for path in extensions.glob("anthropic.claude-code-*") if path.is_dir()]
+        for folder in installed:
+            targets.add_dir(folder)
+        if installed:
+            targets.add_versioned_dir(extensions, "anthropic.claude-code-")
+            found = True
+    return found
+
+
 def resolve_apps(apps: dict[str, bool], custom_apps: str) -> AppTargets:
     """Finds the full paths of the selected programs; ValueError says what is missing."""
     targets = AppTargets()
     running = running_process_paths()
+
+    if apps.get("claude") and not add_claude(targets):
+        raise ValueError(
+            "Claude не найден: нет ни приложения Claude, ни Claude Code. Снимите галочку "
+            "«Claude» или добавьте его .exe кнопкой «+ Добавить программы»."
+        )
 
     if apps.get("chrome"):
         chrome = find_chrome(running)
         if not chrome:
             raise ValueError(
                 "Google Chrome не найден в обычных папках установки. Снимите галочку "
-                "или укажите полный путь к chrome.exe в «Других программах»."
+                "или добавьте chrome.exe кнопкой «+ Добавить программы»."
             )
         for path in chrome:
             targets.add_file(path)
@@ -465,7 +716,7 @@ def resolve_apps(apps: dict[str, bool], custom_apps: str) -> AppTargets:
         if not folders:
             raise ValueError(
                 "VS Code не найден. Запустите его, снимите галочку или укажите "
-                "папку VS Code в «Других программах»."
+                "папку VS Code кнопкой «+ Добавить программы»."
             )
         # The whole folder: Code.exe and the tools bundled with it.
         for folder in folders:
@@ -491,7 +742,10 @@ def resolve_apps(apps: dict[str, bool], custom_apps: str) -> AppTargets:
             elif path.is_file():
                 targets.add_file(path)
             else:
-                raise ValueError(f"Не найден файл или папка: {entry}")
+                raise ValueError(
+                    f"Не найден файл или папка: {entry}\n"
+                    "Снимите галочку у этой программы или удалите её из списка."
+                )
             continue
         # A bare name is turned into the paths of the programs with this name.
         found = [path for path in running if Path(path).name.lower() == entry.lower()]
@@ -499,11 +753,127 @@ def resolve_apps(apps: dict[str, bool], custom_apps: str) -> AppTargets:
         if not found:
             raise ValueError(
                 f"Не удалось найти путь к {entry}: программа не запущена и не "
-                "зарегистрирована в Windows. Запустите её или укажите полный путь к .exe."
+                "зарегистрирована в Windows. Запустите её или добавьте её .exe заново."
             )
         for path in found:
             targets.add_file(path)
     return targets
+
+
+class DesktopApp(NamedTuple):
+    title: str
+    path: str
+
+
+class PickerRow(NamedTuple):
+    entry: str
+    title: str
+    checked: bool
+    covered: bool
+
+
+def desktop_folders() -> list[Path]:
+    """The desktop of the user and the one shared by all users."""
+    folders = []
+    for csidl in (CSIDL_DESKTOPDIRECTORY, CSIDL_COMMON_DESKTOPDIRECTORY):
+        buffer = ctypes.create_unicode_buffer(MAX_PATH)
+        if shell32.SHGetFolderPathW(None, csidl, None, 0, buffer) == 0 and buffer.value:
+            folders.append(Path(buffer.value))
+    return folders
+
+
+def read_shortcuts(paths: list[str]) -> dict[str, tuple[str, str]]:
+    """Target and arguments of .lnk files, keyed by the lowercase path of the shortcut."""
+    if not paths:
+        return {}
+    # The paths come through the environment, so PowerShell never parses them as code.
+    env = {**os.environ, "PROXY_MANAGER_LINKS": json.dumps(paths)}
+    try:
+        result = subprocess.run(
+            [str(POWERSHELL_PATH), "-NoProfile", "-NonInteractive", "-Command", READ_SHORTCUTS_SCRIPT],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            encoding="utf-8-sig",
+            errors="replace",
+            timeout=30,
+            env=env,
+            cwd=str(BASE_DIR),
+            creationflags=NO_WINDOW
+        )
+        items = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        log_app_error(f"Не удалось прочитать ярлыки: {exc}")
+        return {}
+    return {
+        str(item["path"]).lower(): (str(item.get("target") or ""), str(item.get("args") or ""))
+        for item in items if isinstance(item, dict) and item.get("path")
+    }
+
+
+def shortcut_program(target: str, arguments: str) -> str | None:
+    """What goes through the proxy for a shortcut: an .exe, a folder or None if not a program."""
+    lower = target.lower()
+    # Installer stubs and Microsoft Store aliases: the real process runs from another path.
+    if not lower.endswith(".exe") or any(
+        part in lower for part in ("\\windows\\installer\\", "\\microsoft\\windowsapps\\")
+    ):
+        return None
+    path = Path(target)
+    # This app and its interpreter must reach the proxy server directly.
+    if path.parent == Path(sys.executable).parent:
+        return None
+    # Discord, Slack and others run from a folder per version, next to Update.exe;
+    # the shortcut leads to Update.exe itself or to a small starter beside it.
+    if (path.name.lower() == "update.exe" and "--processstart" in arguments.lower()) or (
+        path.with_name("Update.exe").is_file()
+    ):
+        return str(path.parent)
+    # Sites installed as apps start through chrome_proxy.exe, but chrome.exe does the work.
+    if lower.endswith("_proxy.exe"):
+        real = path.with_name(path.name[:-len("_proxy.exe")] + ".exe")
+        if real.is_file():
+            return str(real)
+    return target
+
+
+def find_desktop_apps() -> list[DesktopApp]:
+    """Programs from the desktop shortcuts and .exe files, without duplicates."""
+    links: list[Path] = []
+    apps: dict[str, DesktopApp] = {}
+    for folder in desktop_folders():
+        try:
+            items = sorted(folder.iterdir())
+        except OSError:
+            continue
+        for item in items:
+            suffix = item.suffix.lower()
+            if suffix == ".lnk":
+                links.append(item)
+            elif suffix == ".exe" and item.is_file():
+                apps.setdefault(os.path.normpath(item).lower(), DesktopApp(item.stem, str(item)))
+
+    shortcuts = read_shortcuts([str(link) for link in links])
+    for link in links:
+        target, arguments = shortcuts.get(str(link).lower(), ("", ""))
+        program = shortcut_program(target, arguments)
+        if program:
+            apps.setdefault(os.path.normpath(program).lower(), DesktopApp(link.stem, program))
+    return sorted(apps.values(), key=lambda app: app.title.casefold())
+
+
+def picker_rows(existing: list[dict[str, Any]], apps: list[DesktopApp],
+                covered: AppTargets) -> list[PickerRow]:
+    """Rows of the program picker: the programs of the list first, then the rest of the desktop."""
+    keys = {os.path.normpath(program["path"]).lower() for program in existing}
+    # A bare telegram.exe in the list is the same program as ...\Telegram\Telegram.exe.
+    names = {key for key in keys if not is_path_entry(key)}
+    rows = [PickerRow(program["path"], program["title"], True, False) for program in existing]
+    for app in apps:
+        if os.path.normpath(app.path).lower() in keys or Path(app.path).name.lower() in names:
+            continue
+        is_covered = covered.matches(app.path)
+        rows.append(PickerRow(app.path, app.title, is_covered, is_covered))
+    return rows
 
 
 def scan_executables(folder: str) -> list[str]:
@@ -1029,6 +1399,42 @@ def fetch_external_ip(proxy: str | None) -> str:
             return "не удалось получить"
 
 
+def valve_game_networks() -> list[str]:
+    """Networks of Valve's game servers, to route around the TUN.
+
+    Even when they go direct, games suffer inside the TUN: every UDP packet passes the
+    userspace network stack of sing-box, and the hundreds of relays Steam pings at once to
+    pick a region each cost a process lookup, which distorts the pings.
+    """
+    relays: set[str] = set()
+    try:
+        with requests.Session() as session:
+            session.trust_env = False
+            for app_id in STEAM_GAME_APP_IDS:
+                response = session.get(STEAM_SDR_CONFIG_URL.format(app_id), timeout=5)
+                response.raise_for_status()
+                for pop in response.json().get("pops", {}).values():
+                    relays.update(relay["ipv4"] for relay in pop.get("relays", []) if relay.get("ipv4"))
+        VALVE_RELAYS_CACHE_PATH.write_text(json.dumps(sorted(relays)), encoding="utf-8")
+    except (requests.RequestException, ValueError, AttributeError, KeyError, TypeError, OSError):
+        try:
+            relays = set(json.loads(VALVE_RELAYS_CACHE_PATH.read_text(encoding="utf-8")))
+        except (OSError, ValueError, TypeError):
+            relays = set()
+
+    valve = [ipaddress.ip_network(network) for network in VALVE_NETWORKS]
+    extra = set()
+    for relay in relays:
+        try:
+            address = ipaddress.ip_address(relay)
+        except ValueError:
+            continue
+        if not any(address in network for network in valve):
+            # Relays come in pairs from one /24; a route per /24 keeps the table short.
+            extra.add(ipaddress.ip_network(f"{address}/24", strict=False))
+    return VALVE_NETWORKS + [str(network) for network in sorted(extra)]
+
+
 def rotate_log() -> None:
     try:
         if LOG_PATH.stat().st_size > MAX_LOG_SIZE:
@@ -1237,7 +1643,9 @@ class ProxyManager:
         if data.get("password"):
             outbound["password"] = data["password"]
 
-        app_patterns = data["app_patterns"]
+        route_all = data.get("route_mode") in ("all", "except")
+        # Which traffic the rules for the proxied programs apply to; no condition means all.
+        proxied = {} if route_all else {"process_path_regex": data["app_patterns"]}
         rules: list[dict[str, Any]] = [
             {
                 "inbound": [IP_CHECK_INBOUND_TAG],
@@ -1245,24 +1653,70 @@ class ProxyManager:
                 "outbound": "proxy"
             }
         ]
+        if route_all:
+            rules += [
+                # DNS first: its server is on the TUN, and that is a private address.
+                {
+                    "port": 53,
+                    "action": "hijack-dns"
+                },
+                # The router, printers and other LAN devices stay reachable.
+                {
+                    "ip_is_private": True,
+                    "action": "route",
+                    "outbound": "direct"
+                }
+            ]
+            if data.get("route_mode") == "except" and data.get("excluded_patterns"):
+                # Before the rules of an HTTP proxy: the exceptions keep their UDP and IPv6.
+                rules.append({
+                    "process_path_regex": data["excluded_patterns"],
+                    "action": "route",
+                    "outbound": "direct"
+                })
         if proxy_type == "http":
             rules += [
                 {
-                    "process_path_regex": app_patterns,
+                    **proxied,
                     "ip_version": 6,
                     "action": "reject"
                 },
                 {
-                    "process_path_regex": app_patterns,
+                    **proxied,
                     "network": "udp",
                     "action": "reject"
                 }
             ]
-        rules.append({
-            "process_path_regex": app_patterns,
-            "action": "route",
-            "outbound": "proxy"
-        })
+        if not route_all:
+            rules.append({
+                **proxied,
+                "action": "route",
+                "outbound": "proxy"
+            })
+
+        dns_servers: list[dict[str, Any]] = [{"type": "local", "tag": "dns-local"}]
+        if route_all:
+            # DNS over HTTPS works through both proxy types, unlike DNS over UDP.
+            dns_servers.append({
+                "type": "https",
+                "tag": "dns-remote",
+                "server": "1.1.1.1",
+                "server_port": 443,
+                "path": "/dns-query",
+                "detour": "proxy"
+            })
+
+        tun: dict[str, Any] = {
+            "type": "tun",
+            "tag": "tun-in",
+            "interface_name": "singbox",
+            "address": TUN_ADDRESSES,
+            "auto_route": True,
+            "strict_route": True
+        }
+        if data.get("games_networks"):
+            # No routes into the TUN for these: Windows sends them out directly.
+            tun["route_exclude_address"] = data["games_networks"]
 
         return {
             "log": {
@@ -1271,22 +1725,17 @@ class ProxyManager:
                 "timestamp": True
             },
             "dns": {
-                # DNS servers of the physical adapter, the same as without the proxy.
-                "servers": [{"type": "local", "tag": "dns-local"}],
-                "final": "dns-local",
+                # For selected programs: DNS servers of the physical adapter, the same as
+                # without the proxy. For the whole computer: through the proxy, without leaks;
+                # dns-local then only resolves the address of the proxy server itself.
+                "servers": dns_servers,
+                "final": "dns-remote" if route_all else "dns-local",
                 # The TUN has an IPv6 address, so without this apps would try IPv6
                 # even when the network has no IPv6 connectivity.
                 "strategy": "ipv4_only"
             },
             "inbounds": [
-                {
-                    "type": "tun",
-                    "tag": "tun-in",
-                    "interface_name": "singbox",
-                    "address": TUN_ADDRESSES,
-                    "auto_route": True,
-                    "strict_route": True
-                },
+                tun,
                 {
                     # Lets the app check the external IP of the proxied apps.
                     "type": "http",
@@ -1306,7 +1755,7 @@ class ProxyManager:
                 "auto_detect_interface": True,
                 "default_domain_resolver": "dns-local",
                 "rules": rules,
-                "final": "direct"
+                "final": "proxy" if route_all else "direct"
             }
         }
 
@@ -1317,6 +1766,20 @@ class ProxyManager:
             encoding="utf-8"
         )
         return ip_check_port
+
+    def build_iphone_config(self, data: dict[str, Any]) -> dict[str, Any]:
+        """A profile for the sing-box MT app on iPhone: the whole phone through the proxy."""
+        config = self.build_config({**data, "route_mode": "all", "verbose_log": False}, 0)
+        # iOS manages the TUN itself: it names the interface and has no strict_route.
+        config["inbounds"] = [{
+            "type": "tun",
+            "tag": "tun-in",
+            "address": TUN_ADDRESSES,
+            "auto_route": True
+        }]
+        # The IP check inbound is only for this app on the computer.
+        config["route"]["rules"] = [rule for rule in config["route"]["rules"] if "inbound" not in rule]
+        return config
 
     def _active_config(self) -> dict[str, Any]:
         if not self.is_running():
@@ -1340,8 +1803,28 @@ class ProxyManager:
                 if ":" in server:
                     server = f"[{server}]"
                 kind = PROXY_TYPE_LABELS.get(outbound.get("type"), "?")
-                return f"{kind} · {server}:{outbound.get('server_port')}"
+                mode = {"all": " · весь компьютер", "except": " · все, кроме выбранных"}.get(
+                    self.active_mode(), ""
+                )
+                return f"{kind} · {server}:{outbound.get('server_port')}{mode}"
         return None
+
+    def active_mode(self) -> str | None:
+        """The route mode of the running sing-box."""
+        route = self._active_config().get("route")
+        if not route:
+            return None
+        if route.get("final") != "proxy":
+            return "apps"
+        has_exceptions = any(
+            "process_path_regex" in rule and rule.get("outbound") == "direct"
+            for rule in route.get("rules", [])
+        )
+        return "except" if has_exceptions else "all"
+
+    def routes_everything(self) -> bool:
+        """The running sing-box sends the whole computer through the proxy."""
+        return self._active_config().get("route", {}).get("final") == "proxy"
 
     def _wait_until_started(self, ip_check_port: int) -> bool:
         # The IP check inbound comes after the TUN, so once it listens the TUN is up.
@@ -1427,9 +1910,19 @@ class ProxyManager:
                     "версию sing-box и положите sing-box.exe в папку bin."
                 )
 
+            # With the whole computer proxied, this app's own traffic goes through sing-box
+            # too, and the check below would reach the proxy server through itself.
+            if self.routes_everything():
+                try:
+                    self._stop_singbox()
+                except Exception as exc:
+                    return False, f"Не удалось остановить sing-box: {exc}"
+
             problem = probe_proxy(data)
             if problem:
                 return False, problem
+            if data.get("games_direct"):
+                data = {**data, "games_networks": valve_game_networks()}
 
             was_armed = self.kill_switch.armed
             new_config = CONFIG_PATH.with_name("proxy.new.json")
@@ -1596,6 +2089,8 @@ class ProxyApp:
         self.next_follow = 0.0
         self.tray: pystray.Icon | None = None
         self.tray_hint_shown = False
+        self.picker: AppPicker | None = None
+        self.program_rows: list[Any] = []
         self.ui_calls: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
 
         ctk.set_appearance_mode("dark")
@@ -1603,8 +2098,8 @@ class ProxyApp:
 
         self.root = ctk.CTk()
         self.root.title("Proxy Manager")
-        self.root.geometry("500x690")
-        self.root.minsize(460, 650)
+        self.root.geometry("500x730")
+        self.root.minsize(460, 690)
         self.root.protocol("WM_DELETE_WINDOW", self.hide_window)
         self.root.report_callback_exception = self._on_tk_error
         if ensure_icon_file():
@@ -1613,8 +2108,14 @@ class ProxyApp:
         self.active_proxy_type = self.settings["proxy_type"]
         self.proxy_type_var = ctk.StringVar(value=PROXY_TYPE_LABELS[self.active_proxy_type])
         self.show_password_var = ctk.BooleanVar(value=False)
+        self.route_mode_var = ctk.StringVar(value=ROUTE_MODE_LABELS[self.settings["route_mode"]])
+        # Which checkboxes the program list shows: what goes through the proxy ("apps")
+        # or the exceptions of the "all except the selected" mode ("except").
+        self.list_mode = "except" if self.settings["route_mode"] == "except" else "apps"
+        seed_exceptions(self.settings)
         self._build_ui()
         self._show_profile(self.active_proxy_type)
+        self._update_app_widgets()
 
         # A sing-box left by a crashed instance is picked up, a stale PID file is removed.
         self.manager.reap_exited()
@@ -1651,11 +2152,6 @@ class ProxyApp:
             self.root, text="PROXY MANAGER",
             font=ctk.CTkFont(size=24, weight="bold")
         ).pack(pady=(14, 0))
-
-        ctk.CTkLabel(
-            self.root, text="Трафик выбранных программ через прокси",
-            text_color="gray"
-        ).pack()
 
         self.status_label = ctk.CTkLabel(
             self.root, text="", font=ctk.CTkFont(size=16, weight="bold")
@@ -1694,40 +2190,63 @@ class ProxyApp:
             "password": self.password_entry
         }
 
-        ctk.CTkLabel(self.root, text="Через прокси", anchor="w", height=20).pack(
-            fill="x", padx=PAD_X + 4, pady=(12, 2)
+        ctk.CTkSegmentedButton(
+            self.root,
+            values=list(ROUTE_MODE_LABELS.values()),
+            variable=self.route_mode_var,
+            command=self._on_route_mode_changed,
+            height=32
+        ).pack(fill="x", padx=PAD_X, pady=(12, 0))
+
+        # The whole computer mode has no program list and disables these.
+        self.app_widgets: list[Any] = []
+        self.program_widgets: list[Any] = []
+        self.program_vars: list[ctk.BooleanVar] = []
+
+        header = ctk.CTkFrame(self.root, fg_color="transparent")
+        header.pack(fill="x", padx=PAD_X, pady=(8, 0))
+        self.programs_label = ctk.CTkLabel(header, text="", anchor="w", height=26)
+        self.programs_label.pack(side="left", padx=4)
+        add_button = ctk.CTkButton(
+            header, text="+ Добавить программы", height=26, width=160,
+            fg_color="#444b59", hover_color="#343a46",
+            command=self.open_app_picker
         )
-        apps_row = ctk.CTkFrame(self.root, fg_color="transparent")
-        apps_row.pack(fill="x", padx=PAD_X)
+        add_button.pack(side="right")
+        self.app_widgets.append(add_button)
+
+        # Two columns: the built-in programs first, then the ones added by the user.
+        self.programs_frame = ctk.CTkScrollableFrame(self.root, height=104)
+        # The scrollbar has a minimal length of its own that would stretch the short list.
+        self.programs_frame._scrollbar.configure(height=0)
+        self.programs_frame.pack(fill="x", padx=PAD_X, pady=(4, 0))
+        self.programs_frame.grid_columnconfigure((0, 1), weight=1, uniform="programs")
         self.app_vars: dict[str, ctk.BooleanVar] = {}
-        for key, title in APP_PRESETS.items():
-            var = ctk.BooleanVar(value=self.settings["apps"][key])
-            ctk.CTkCheckBox(
-                apps_row, text=title, variable=var,
-                onvalue=True, offvalue=False,
-                command=self._on_apps_changed
-            ).pack(side="left", padx=(4, 12))
+        for index, (key, title) in enumerate(APP_PRESETS.items()):
+            var = ctk.BooleanVar(value=self._preset_flags()[key])
+            checkbox = self._program_checkbox(self.programs_frame, title, var)
+            checkbox.grid(row=index // 2, column=index % 2, sticky="w", padx=4, pady=3)
+            self.app_widgets.append(checkbox)
             self.app_vars[key] = var
 
-        self.custom_apps_entry = ctk.CTkEntry(
-            self.root, height=34,
-            placeholder_text="Другие программы: telegram.exe или полный путь к .exe/папке"
-        )
-        self.custom_apps_entry.pack(fill="x", padx=PAD_X, pady=(6, 0))
-        if self.settings["custom_apps"]:
-            self.custom_apps_entry.insert(0, self.settings["custom_apps"])
-        for sequence in ("<FocusOut>", "<Return>"):
-            self.custom_apps_entry.bind(sequence, self._on_custom_apps_edited)
-
         self.kill_switch_var = ctk.BooleanVar(value=self.settings["kill_switch"])
-        ctk.CTkCheckBox(
-            self.root, text="Kill switch: без прокси эти программы остаются без интернета",
+        self.kill_switch_box = ctk.CTkCheckBox(
+            self.root, text="Kill switch: без прокси эти программы без интернета",
             variable=self.kill_switch_var, onvalue=True, offvalue=False,
             command=self._on_apps_changed
-        ).pack(fill="x", padx=PAD_X + 4, pady=(8, 0))
+        )
+        self.kill_switch_box.pack(fill="x", padx=PAD_X + 4, pady=(8, 0))
+
+        self.games_direct_var = ctk.BooleanVar(value=self.settings["games_direct"])
+        ctk.CTkCheckBox(
+            self.root, text="Игры Steam (Dota 2, CS2) напрямую, мимо туннеля",
+            variable=self.games_direct_var, onvalue=True, offvalue=False,
+            command=self._on_games_direct_changed
+        ).pack(fill="x", padx=PAD_X + 4, pady=(6, 0))
+        self._render_programs()
 
         buttons = ctk.CTkFrame(self.root, fg_color="transparent")
-        buttons.pack(fill="x", padx=PAD_X, pady=(16, 0))
+        buttons.pack(fill="x", padx=PAD_X, pady=(12, 0))
         buttons.grid_columnconfigure((0, 1), weight=1, uniform="buttons")
         self.connect_button = ctk.CTkButton(
             buttons, text="ПОДКЛЮЧИТЬ", height=42,
@@ -1759,6 +2278,11 @@ class ProxyApp:
             ip_buttons, text="Открыть лог", height=30, width=110,
             fg_color="#444b59", hover_color="#343a46",
             command=self.open_log
+        ).pack(side="left", padx=4)
+        ctk.CTkButton(
+            ip_buttons, text="Для iPhone", height=30, width=100,
+            fg_color="#444b59", hover_color="#343a46",
+            command=self.export_iphone_profile
         ).pack(side="left", padx=4)
 
         # A read-only text box: long errors stay readable and can be copied.
@@ -1808,13 +2332,84 @@ class ProxyApp:
         }
         self.settings["proxy_type"] = self.active_proxy_type
 
-    def _selected_apps(self) -> dict[str, bool]:
-        return {key: var.get() for key, var in self.app_vars.items()}
+    def _preset_flags(self) -> dict[str, bool]:
+        """The checkboxes of the built-in programs for what the list shows now."""
+        return self.settings["excluded_apps" if self.list_mode == "except" else "apps"]
+
+    def _route_mode(self) -> str:
+        label = self.route_mode_var.get()
+        return next((mode for mode, text in ROUTE_MODE_LABELS.items() if text == label), "apps")
+
+    def _program_checkbox(self, parent: Any, title: str, var: ctk.BooleanVar) -> ctk.CTkCheckBox:
+        # A column fits about 19 characters next to the remove button.
+        return ctk.CTkCheckBox(
+            parent, text=title if len(title) <= 19 else title[:18] + "…", variable=var,
+            onvalue=True, offvalue=False, width=0,
+            checkbox_width=20, checkbox_height=20,
+            command=self._on_apps_changed
+        )
+
+    def _render_programs(self) -> None:
+        """Shows the programs added by the user after the built-in ones."""
+        for widget in self.program_rows:
+            widget.destroy()
+        self.program_rows, self.program_widgets, self.program_vars = [], [], []
+        for index, program in enumerate(self.settings["programs"]):
+            cell = len(APP_PRESETS) + index
+            row = ctk.CTkFrame(self.programs_frame, fg_color="transparent")
+            row.grid(row=cell // 2, column=cell % 2, sticky="ew", padx=4, pady=3)
+            var = ctk.BooleanVar(value=program[PROGRAM_FLAGS[self.list_mode]])
+            checkbox = self._program_checkbox(row, program["title"], var)
+            checkbox.pack(side="left")
+            remove_button = ctk.CTkButton(
+                row, text="✕", width=22, height=20,
+                fg_color="transparent", hover_color="#842727", text_color="gray",
+                command=lambda index=index: self._remove_program(index)
+            )
+            remove_button.pack(side="right")
+            self.program_rows.append(row)
+            self.program_widgets += [checkbox, remove_button]
+            self.program_vars.append(var)
+        self._update_app_widgets()
+
+    def _remove_program(self, index: int) -> None:
+        self._store_apps()
+        removed = self.settings["programs"].pop(index)
+        self._render_programs()
+        self._save_settings()
+        message = f"«{removed['title']}» убрана из списка."
+        if self.running:
+            message += " Нажмите «Переподключить», чтобы применить."
+        self._show_message(message)
+
+    def _update_app_widgets(self) -> None:
+        mode = self._route_mode()
+        state = "disabled" if mode == "all" else "normal"
+        for widget in self.app_widgets + self.program_widgets:
+            widget.configure(state=state)
+        # The filters list programs, so the kill switch only works for the selected ones.
+        self.kill_switch_box.configure(state="normal" if mode == "apps" else "disabled")
+        self.programs_label.configure(
+            text="Напрямую, мимо прокси" if self.list_mode == "except" else "Программы через прокси"
+        )
+
+    def _show_list_mode(self, list_mode: str) -> None:
+        """Switches the list between the proxied programs and the exceptions."""
+        if list_mode == self.list_mode:
+            return
+        self._store_apps()
+        self.list_mode = list_mode
+        for key, var in self.app_vars.items():
+            var.set(self._preset_flags()[key])
+        self._render_programs()
 
     def _store_apps(self) -> None:
-        self.settings["apps"] = self._selected_apps()
-        self.settings["custom_apps"] = self.custom_apps_entry.get().strip()
+        self.settings["route_mode"] = self._route_mode()
+        self._preset_flags().update({key: var.get() for key, var in self.app_vars.items()})
+        for program, var in zip(self.settings["programs"], self.program_vars):
+            program[PROGRAM_FLAGS[self.list_mode]] = var.get()
         self.settings["kill_switch"] = self.kill_switch_var.get()
+        self.settings["games_direct"] = self.games_direct_var.get()
 
     def _save_settings(self) -> None:
         self._store_current_profile()
@@ -1831,9 +2426,61 @@ class ProxyApp:
                 "Список программ изменён. Нажмите «Переподключить», чтобы применить."
             )
 
-    def _on_custom_apps_edited(self, _event: Any = None) -> None:
-        if self.custom_apps_entry.get().strip() != self.settings["custom_apps"]:
-            self._on_apps_changed()
+    def _on_route_mode_changed(self, _value: str) -> None:
+        mode = self._route_mode()
+        if mode in PROGRAM_FLAGS:
+            self._show_list_mode(mode)
+        self._update_app_widgets()
+        self._save_settings()
+        if mode == "all":
+            message = (
+                "Через прокси пойдёт весь интернет-трафик компьютера, кроме локальной сети. "
+                "Kill switch в этом режиме не работает: если sing-box упадёт, трафик пойдёт напрямую."
+            )
+            if self.active_proxy_type == "http":
+                message += " HTTP-прокси не передаёт UDP: звонки и часть игр работать не будут."
+        elif mode == "except":
+            message = (
+                "Через прокси пойдёт весь компьютер, кроме отмеченных в списке программ: они "
+                "ходят напрямую. Kill switch в этом режиме не работает."
+            )
+            if self.active_proxy_type == "http":
+                message += (
+                    " HTTP-прокси не передаёт UDP: звонки и игры будут работать только "
+                    "в программах из списка."
+                )
+        else:
+            message = "Через прокси пойдут только выбранные программы."
+        if self.running:
+            message += " Нажмите «Переподключить», чтобы применить."
+        self._show_message(message)
+
+    def _on_games_direct_changed(self) -> None:
+        self._save_settings()
+        if self.games_direct_var.get():
+            message = "Dota 2 и CS2 будут ходить к серверам Valve напрямую, мимо туннеля."
+        else:
+            message = "Трафик игр Steam снова пойдёт через туннель, как у остальных программ."
+        if self.running:
+            message += " Нажмите «Переподключить», чтобы применить."
+        self._show_message(message)
+
+    def open_app_picker(self) -> None:
+        if self.picker is not None and self.picker.winfo_exists():
+            self.picker.lift()
+            self.picker.focus_force()
+            return
+        self.picker = AppPicker(self)
+
+    def set_programs(self, programs: list[dict[str, Any]]) -> None:
+        self.settings["programs"] = programs
+        self._render_programs()
+        self._save_settings()
+        if self.running:
+            message = "Список программ изменён. Нажмите «Переподключить», чтобы применить."
+        else:
+            message = "Список программ сохранён: он останется и при следующих запусках."
+        self._show_message(message)
 
     def _show_profile(self, proxy_type: str) -> None:
         profile = self.settings["profiles"][proxy_type]
@@ -1865,7 +2512,8 @@ class ProxyApp:
             self._set_entry(self.profile_entries[key], value)
         self._save_settings()
 
-    def _get_form_data(self) -> dict[str, Any]:
+    def _get_proxy_fields(self) -> dict[str, Any]:
+        """The proxy server from the form; ValueError says what is wrong."""
         self._apply_proxy_string()
         host = self.host_entry.get().strip().strip("[]")
         if not host:
@@ -1881,20 +2529,40 @@ class ProxyApp:
             port = 0
         if not 1 <= port <= 65535:
             raise ValueError("Порт должен быть числом от 1 до 65535.")
-
-        targets = resolve_apps(self._selected_apps(), self.custom_apps_entry.get())
-        if not targets:
-            raise ValueError("Выберите хотя бы одну программу, которая будет работать через прокси.")
-
         return {
             "proxy_type": self.active_proxy_type,
             "host": host,
             "port": port,
             "username": self.user_entry.get().strip(),
-            "password": self.password_entry.get(),
+            "password": self.password_entry.get()
+        }
+
+    def _get_form_data(self) -> dict[str, Any]:
+        proxy = self._get_proxy_fields()
+        route_mode = self._route_mode()
+        self._store_apps()
+        targets = AppTargets()
+        excluded = AppTargets()
+        if route_mode == "apps":
+            targets = resolve_apps(self.settings["apps"], programs_text(self.settings["programs"]))
+            if not targets:
+                raise ValueError(
+                    "Выберите хотя бы одну программу, которая будет работать через прокси."
+                )
+        elif route_mode == "except":
+            excluded = resolve_apps(
+                self.settings["excluded_apps"], programs_text(self.settings["programs"], "excluded")
+            )
+
+        return {
+            **proxy,
+            "route_mode": route_mode,
             "targets": targets,
             "app_patterns": targets.regex_patterns(),
-            "kill_switch": self.kill_switch_var.get(),
+            "excluded_patterns": excluded.regex_patterns(),
+            # The filters list programs, so they cannot cover the whole computer.
+            "kill_switch": route_mode == "apps" and self.kill_switch_var.get(),
+            "games_direct": self.games_direct_var.get(),
             "verbose_log": self.settings["verbose_log"]
         }
 
@@ -1970,10 +2638,16 @@ class ProxyApp:
         # This app itself is not in the proxied list, so the proxy IP is checked
         # through the local sing-box inbound.
         proxy_url = self.manager.ip_check_proxy()
+        # With the whole computer proxied this app goes through the TUN like any other.
+        active_mode = self.manager.active_mode()
 
         def worker() -> None:
             direct_ip = fetch_external_ip(None)
-            if proxy_url:
+            if active_mode == "all":
+                text = f"Весь компьютер: {direct_ip}"
+            elif active_mode == "except":
+                text = f"Все, кроме выбранных: {direct_ip}\nВыбранные идут напрямую, с вашим IP"
+            elif proxy_url:
                 text = (
                     f"Выбранные программы: {fetch_external_ip(proxy_url)}\n"
                     f"Остальные программы: {direct_ip}"
@@ -1998,6 +2672,65 @@ class ProxyApp:
             os.startfile(LOG_PATH if LOG_PATH.exists() else LOG_DIR)
         except OSError as exc:
             self._show_message(f"Не удалось открыть лог: {exc}")
+
+    def export_iphone_profile(self) -> None:
+        """Saves a sing-box profile for iPhone with the proxy from the form."""
+        try:
+            proxy = self._get_proxy_fields()
+        except ValueError as exc:
+            self._show_message(str(exc))
+            return
+        text = json.dumps(self.manager.build_iphone_config(proxy), indent=2, ensure_ascii=False)
+
+        folders = desktop_folders()
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Сохранить профиль для iPhone",
+            initialdir=str(folders[0]) if folders else None,
+            initialfile="proxy-iphone.json",
+            defaultextension=".json",
+            filetypes=[("Профиль sing-box", "*.json")]
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(text, encoding="utf-8")
+            if BIN_PATH.is_file():
+                check = subprocess.run(
+                    [str(BIN_PATH), "check", "--disable-color", "-c", path],
+                    stdin=subprocess.DEVNULL, capture_output=True, encoding="utf-8",
+                    errors="replace", timeout=20, cwd=str(BASE_DIR), creationflags=NO_WINDOW
+                )
+                if check.returncode != 0:
+                    detail = strip_ansi(check.stderr or check.stdout).strip()
+                    self._show_message(f"Профиль не прошёл проверку sing-box:\n{detail}")
+                    return
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            self._show_message(f"Не удалось сохранить профиль: {exc}")
+            return
+
+        # Telegram on the phone takes the text as it is; the file goes through the Files app.
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._show_message(f"Профиль для iPhone сохранён: {path}\nТекст профиля скопирован в буфер обмена.")
+        warning = (
+            "\n\nДля HTTP-прокси звонки (FaceTime, WhatsApp, Telegram) и часть игр работать "
+            "не будут: HTTP-прокси не передаёт UDP."
+            if proxy["proxy_type"] == "http" else ""
+        )
+        messagebox.showinfo(
+            "Профиль для iPhone",
+            f"Профиль сохранён в файл {Path(path).name} и скопирован в буфер обмена.\n\n"
+            "1. Установите на iPhone бесплатное приложение sing-box MT из App Store.\n"
+            "2. Отправьте профиль себе в Telegram, в «Избранное»: вставьте текст (Ctrl+V) "
+            "или перетащите файл.\n"
+            "3. В sing-box MT создайте новый профиль типа Local: вставьте в редактор "
+            "скопированный из Telegram текст или импортируйте файл, сохранённый в «Файлы».\n"
+            "4. Выберите профиль и включите его, разрешите добавить конфигурацию VPN.\n\n"
+            "Через прокси пойдёт весь телефон, кроме локальной сети. В профиле записан пароль "
+            "от прокси: после импорта удалите сообщение в Telegram и файл." + warning,
+            parent=self.root
+        )
 
     def _show_message(self, message: str) -> None:
         self.message_box.configure(state="normal")
@@ -2095,7 +2828,7 @@ class ProxyApp:
                 self.manager.kill_switch.refresh()
                 if self.manager.kill_switch.armed and self.manager.targets is None:
                     self.manager.targets = resolve_apps(
-                        self.settings["apps"], self.settings["custom_apps"]
+                        self.settings["apps"], programs_text(self.settings["programs"])
                     )
             except Exception:
                 log_app_error(traceback.format_exc())
@@ -2201,6 +2934,162 @@ class ProxyApp:
 
         # If a connection is being made, disconnect() waits for it and then stops sing-box.
         self._run_operation("Отключение...", self.manager.disconnect, done)
+
+
+class AppPicker(ctk.CTkToplevel):
+    """A window to add programs to the list: from the desktop, an .exe or a folder."""
+
+    def __init__(self, app: ProxyApp) -> None:
+        super().__init__(app.root)
+        self.app = app
+        self.rows: list[tuple[PickerRow, ctk.BooleanVar]] = []
+        self.title("Добавить программы")
+        self.geometry(f"440x520+{app.root.winfo_x() + 30}+{app.root.winfo_y() + 60}")
+        self.minsize(380, 360)
+        self.transient(app.root)
+        if ICON_PATH.is_file():
+            self.iconbitmap(str(ICON_PATH))
+
+        buttons = ctk.CTkFrame(self, fg_color="transparent")
+        buttons.pack(side="bottom", fill="x", padx=16, pady=(6, 14))
+        ctk.CTkButton(
+            buttons, text="Файл...", width=80,
+            fg_color="#444b59", hover_color="#343a46",
+            command=self._browse
+        ).pack(side="left")
+        ctk.CTkButton(
+            buttons, text="Папка...", width=80,
+            fg_color="#444b59", hover_color="#343a46",
+            command=self._browse_folder
+        ).pack(side="left", padx=(6, 0))
+        ctk.CTkButton(
+            buttons, text="Готово", width=90,
+            fg_color="#168b52", hover_color="#116b3e",
+            command=self._apply
+        ).pack(side="right")
+        ctk.CTkButton(
+            buttons, text="Отмена", width=90,
+            fg_color="#444b59", hover_color="#343a46",
+            command=self.destroy
+        ).pack(side="right", padx=(0, 6))
+
+        ctk.CTkLabel(
+            self, text_color="gray", wraplength=400, justify="left", anchor="w",
+            text="Это программы с рабочего стола. Игр Steam и других лаунчеров (.url) и "
+                 "приложений из Microsoft Store здесь нет: для них нажмите «Файл...» и укажите "
+                 ".exe. «Папка...» добавляет все программы из папки."
+        ).pack(side="bottom", fill="x", padx=18, pady=(6, 0))
+
+        self.list_frame = ctk.CTkScrollableFrame(self)
+        self.list_frame.pack(fill="both", expand=True, padx=16, pady=(14, 0))
+        self.status_label = ctk.CTkLabel(self.list_frame, text="Читаем ярлыки...", text_color="gray")
+        self.status_label.pack(pady=20)
+
+        self.after(200, self._grab)
+        app._store_apps()
+        existing = [dict(program) for program in app.settings["programs"]]
+        self.existing = {os.path.normpath(program["path"]).lower(): program for program in existing}
+        selected = dict(app._preset_flags())
+        threading.Thread(target=self._load, args=(existing, selected), daemon=True).start()
+
+    def _grab(self) -> None:
+        try:
+            self.grab_set()
+            self.focus_force()
+        except TclError:
+            pass
+
+    def _load(self, existing: list[dict[str, Any]], selected: dict[str, bool]) -> None:
+        try:
+            try:
+                covered = resolve_apps(selected, "")
+            except ValueError:
+                covered = AppTargets()
+            for program in existing:
+                if is_path_entry(program["path"]) and Path(program["path"]).is_dir():
+                    covered.add_dir(program["path"])
+            rows = picker_rows(existing, find_desktop_apps(), covered)
+        except Exception:
+            log_app_error(traceback.format_exc())
+            rows = picker_rows(existing, [], AppTargets())
+        self.app._call_in_ui(lambda: self._show_rows(rows))
+
+    def _show_rows(self, rows: list[PickerRow]) -> None:
+        if not self.winfo_exists():
+            return
+        self.status_label.pack_forget()
+        if not rows:
+            self.status_label.configure(text="На рабочем столе не найдено программ.")
+            self.status_label.pack(pady=20)
+        for row in rows:
+            self._add_row(row)
+
+    def _add_row(self, row: PickerRow) -> None:
+        self.status_label.pack_forget()
+        var = ctk.BooleanVar(value=row.checked)
+        name = Path(row.entry).name or row.entry
+        details = "уже в списке" if row.covered else name
+        text = row.title if row.title.lower() == name.lower() else f"{row.title}  ({details})"
+        ctk.CTkCheckBox(
+            self.list_frame, text=text, variable=var,
+            onvalue=True, offvalue=False,
+            state="disabled" if row.covered else "normal"
+        ).pack(fill="x", padx=6, pady=4)
+        self.rows.append((row, var))
+
+    def _browse(self) -> None:
+        folders = desktop_folders()
+        paths = filedialog.askopenfilenames(
+            parent=self,
+            title="Выберите программы",
+            initialdir=str(folders[0]) if folders else None,
+            filetypes=[("Программы и ярлыки", ("*.exe", "*.lnk"))]
+        )
+        known = {os.path.normpath(row.entry).lower(): var for row, var in self.rows}
+        shortcuts = read_shortcuts([
+            os.path.normpath(path) for path in paths if path.lower().endswith(".lnk")
+        ])
+        for path in map(os.path.normpath, paths):
+            program: str | None = path
+            if path.lower().endswith(".lnk"):
+                program = shortcut_program(*shortcuts.get(path.lower(), ("", "")))
+            if program is None:
+                self.app._show_message(f"Ярлык не ведёт к программе: {Path(path).name}")
+                continue
+            existing = known.get(os.path.normpath(program).lower())
+            if existing is not None:
+                existing.set(True)
+                continue
+            self._add_row(PickerRow(program, Path(path).stem, True, False))
+
+    def _browse_folder(self) -> None:
+        folder = filedialog.askdirectory(parent=self, title="Выберите папку программы")
+        if not folder:
+            return
+        folder = os.path.normpath(folder)
+        for row, var in self.rows:
+            if os.path.normpath(row.entry).lower() == folder.lower():
+                var.set(True)
+                return
+        self._add_row(PickerRow(folder, f"Папка {Path(folder).name or folder}", True, False))
+
+    def _apply(self) -> None:
+        programs: list[dict[str, Any]] = []
+        for row, var in self.rows:
+            if not var.get() or row.covered:
+                continue
+            # A program already in the list keeps its own checkboxes; a new one is
+            # checked in the list that is shown now.
+            known = self.existing.get(os.path.normpath(row.entry).lower())
+            if known:
+                programs.append(known)
+            else:
+                add_program(
+                    programs, row.entry, row.title,
+                    enabled=self.app.list_mode == "apps", excluded=self.app.list_mode == "except"
+                )
+        self.app.set_programs(programs)
+        self.destroy()
 
 
 def main() -> None:
